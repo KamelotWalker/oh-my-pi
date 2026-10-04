@@ -11,6 +11,7 @@ import { join } from "node:path";
 import {
 	consolidateToEpisodic,
 	extractAndStoreFacts,
+	storeExtractedFactCategories,
 	storeFactStrings,
 } from "@oh-my-pi/pi-mnemopi/core/beam/consolidate";
 import { factRecall, recallEnhanced } from "@oh-my-pi/pi-mnemopi/core/beam/recall";
@@ -73,6 +74,7 @@ describe("observation classification", () => {
 		expect(classifyObservation("The user dislikes slow tests", "The user dislikes flaky tests")).toBe("distinct");
 		expect(normalizeObservationText("Kullanıcı çay sever")).toBe("kullanıcı çay sever");
 		expect(classifyObservation("Kullanıcı çay sever", "kullanıcı çay sever")).toBe("same");
+		expect(classifyObservation("The user does not prefer dark mode", "The user prefers dark mode")).toBe("contradicts");
 	});
 
 	it("adds a small boost only after the first distinct source", () => {
@@ -83,12 +85,12 @@ describe("observation classification", () => {
 });
 
 describe("preference observations", () => {
-	it("collapses the same preference from two sessions into one record with evidence 2", () => {
+	it("collapses the same preference from two sources in one session into one record with evidence 2", () => {
 		const db = new Database(":memory:");
 		initBeam(db);
 		try {
 			const first = makeBeam(db, "session-a");
-			const second = makeBeam(db, "session-b");
+			const second = makeBeam(db, "session-a");
 			storeFactStrings(first, ["The user prefers dark mode"], 0, "mem-a");
 			storeFactStrings(second, ["The user prefers dark mode"], 0, "mem-b");
 
@@ -119,7 +121,6 @@ describe("preference observations", () => {
 			expect(db.query("SELECT scope FROM facts WHERE object = 'The user prefers dark mode'").get()).toEqual({
 				scope: "session",
 			});
-			expect(factRecall(second, "prefers dark mode", 5)).toEqual([]);
 
 			const journal = db.query("SELECT memory_id, validator, action, note FROM memory_validations").all() as Array<{
 				memory_id: string;
@@ -147,8 +148,8 @@ describe("preference observations", () => {
 		const db = new Database(":memory:");
 		initBeam(db);
 		try {
-			const later = makeBeam(db, "session-c");
-			storeFactStrings(makeBeam(db, "session-a"), ["The user prefers dark mode"], 0, "mem-a");
+			const later = makeBeam(db, "session-a");
+			storeFactStrings(later, ["The user prefers dark mode"], 0, "mem-a");
 			storeFactStrings(later, ["The user dislikes dark mode"], 0, "mem-c");
 
 			const rows = db.query("SELECT fact_id, object, superseded_by FROM facts ORDER BY object").all() as Array<{
@@ -437,6 +438,130 @@ describe("observation regressions", () => {
 			left.close();
 			right.close();
 			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("restores an aged preference when the winning source is forgotten", () => {
+		const db = new Database(":memory:");
+		initBeam(db);
+		try {
+			const beam = makeBeam(db, "session-a");
+			insertWorking(db, "mem-a", beam.sessionId);
+			insertWorking(db, "mem-b", beam.sessionId);
+			storeFactStrings(beam, ["The user prefers dark mode"], 0, "mem-a");
+			storeFactStrings(beam, ["The user dislikes dark mode"], 0, "mem-b");
+			expect(forgetWorking(beam, "mem-b")).toBe(true);
+			expect(
+				db.query("SELECT superseded_by FROM facts WHERE object = 'The user prefers dark mode'").get(),
+			).toEqual({ superseded_by: null });
+			expect(factRecall(beam, "prefers dark mode", 5).map(row => row.content)).toEqual([
+				"The user prefers dark mode",
+			]);
+			expect(
+				db.query("SELECT superseded_by FROM memoria_preferences WHERE preference = 'The user prefers dark mode'").get(),
+			).toEqual({ superseded_by: null });
+		} finally {
+			db.close();
+		}
+	});
+
+	it("revives a confirmed workplace before aging the previous winner", () => {
+		const db = new Database(":memory:");
+		initBeam(db);
+		try {
+			const beam = makeBeam(db, "session-a");
+			const empty = { facts: [], instructions: [], preferences: [], timelines: [], kg: [] };
+			storeExtractedFactCategories(
+				beam,
+				{ ...empty, kg: [{ subject: "Alice", predicate: "works_at", object: "Acme" }] },
+				0,
+				"src-a",
+			);
+			storeExtractedFactCategories(
+				beam,
+				{ ...empty, kg: [{ subject: "Alice", predicate: "works_at", object: "Beta" }] },
+				0,
+				"src-b",
+			);
+			storeExtractedFactCategories(
+				beam,
+				{ ...empty, kg: [{ subject: "Alice", predicate: "works_at", object: "Acme" }] },
+				0,
+				"src-c",
+			);
+			const rows = db
+				.query("SELECT object, superseded_by FROM consolidated_facts WHERE subject = 'Alice' AND predicate = 'works_at'")
+				.all() as Array<{ object: string; superseded_by: string | null }>;
+			const acme = rows.find(row => row.object === "Acme");
+			const beta = rows.find(row => row.object === "Beta");
+			if (acme === undefined || beta === undefined) throw new Error("expected both workplaces");
+			expect(acme.superseded_by).toBeNull();
+			expect(beta.superseded_by).not.toBeNull();
+		} finally {
+			db.close();
+		}
+	});
+
+	it("lets each session recall its own copy and does not let a private negation erase another session", () => {
+		const db = new Database(":memory:");
+		initBeam(db);
+		try {
+			const first = makeBeam(db, "session-a");
+			const second = makeBeam(db, "session-b");
+			storeFactStrings(first, ["The user prefers dark mode"], 0, "mem-a");
+			storeFactStrings(second, ["The user prefers dark mode"], 0, "mem-b");
+			storeFactStrings(second, ["The user dislikes dark mode"], 0, "mem-c");
+			expect(factRecall(first, "prefers dark mode", 5).map(row => row.content)).toEqual([
+				"The user prefers dark mode",
+			]);
+			expect(factRecall(second, "dark mode", 5).map(row => row.content)).toEqual([
+				"The user dislikes dark mode",
+			]);
+			expect(
+				db
+					.query(
+						"SELECT superseded_by FROM facts WHERE object = 'The user prefers dark mode' AND session_id = 'session-a'",
+					)
+					.get(),
+			).toEqual({ superseded_by: null });
+		} finally {
+			db.close();
+		}
+	});
+
+	it("keeps C++ and C# as distinct observations", () => {
+		const db = new Database(":memory:");
+		initBeam(db);
+		try {
+			const beam = makeBeam(db, "session-a");
+			storeFactStrings(beam, ["The app uses C++"], 0, "mem-a");
+			storeFactStrings(beam, ["The app uses C#"], 0, "mem-b");
+			const objects = (
+				db.query("SELECT object FROM facts ORDER BY object").all() as Array<{ object: string }>
+			).map(row => row.object);
+			expect(objects).toEqual(["The app uses C#", "The app uses C++"]);
+			expect(factRecall(beam, "C#", 5).map(row => row.content)).toContain("The app uses C#");
+		} finally {
+			db.close();
+		}
+	});
+
+	it("attributes a multi-source summary to the summary itself so forgetting one source keeps the fact", () => {
+		const db = new Database(":memory:");
+		initBeam(db);
+		try {
+			const beam = makeBeam(db, "session-a");
+			insertWorking(db, "w1", beam.sessionId);
+			insertWorking(db, "w2", beam.sessionId);
+			const summaryId = consolidateToEpisodic(beam, "I prefer rust", ["w1", "w2"]);
+			const row = db
+				.query("SELECT sources_json FROM facts WHERE object LIKE '%rust%'")
+				.get() as { sources_json: string };
+			expect(JSON.parse(row.sources_json)).toEqual([summaryId]);
+			expect(forgetWorking(beam, "w1")).toBe(true);
+			expect(db.query("SELECT COUNT(*) AS count FROM facts WHERE object LIKE '%rust%'").get()).toEqual({ count: 1 });
+		} finally {
+			db.close();
 		}
 	});
 });

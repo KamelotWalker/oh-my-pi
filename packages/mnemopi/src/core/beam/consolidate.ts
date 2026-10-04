@@ -11,7 +11,7 @@ import {
 	clampVeracity,
 	computeFactId,
 	mergeEvidenceSources,
-	normalizeObservationText,
+	observationIdentityText,
 	recordMemoryValidation,
 	SINGLE_VALUED_PREDICATES,
 	VERACITY_WEIGHTS,
@@ -327,16 +327,8 @@ function evidenceSource(beam: BeamMemoryState, sourceMemoryId: string | null): E
 		scope: string | null;
 	} | null;
 	if (episodic?.summary_of) {
-		const first = episodic.summary_of
-			.split(",")
-			.map(part => part.trim())
-			.find(part => part !== "");
-		if (first !== undefined) {
-			const scope = memoryScope(beam, first) ?? episodic.scope ?? "session";
-			return { sourceId: first, fromSummary: true, scope: scope === "" ? "session" : scope };
-		}
-		const summaryScope = episodic.scope ?? "session";
-		return { sourceId: raw, fromSummary: true, scope: summaryScope === "" ? "session" : summaryScope };
+		const summaryScope = episodic.scope && episodic.scope !== "" ? episodic.scope : "session";
+		return { sourceId: raw, fromSummary: true, scope: summaryScope };
 	}
 	const scope = memoryScope(beam, raw) ?? "session";
 	return { sourceId: raw, fromSummary: false, scope: scope === "" ? "session" : scope };
@@ -348,8 +340,24 @@ function seededSources(raw: string | null, legacySource: string | null): string 
 	return legacy === "" ? null : JSON.stringify([legacy]);
 }
 
-function canonicalFactId(memoryKind: MemoryFactKind, factType: string, key: string, value: string): string {
-	return stableMemoryId(`${memoryKind}\0${factType}\0${key}\0${normalizeObservationText(value)}`, "");
+function canonicalFactId(
+	memoryKind: MemoryFactKind,
+	factType: string,
+	key: string,
+	value: string,
+	scope: string,
+	sessionId: string,
+): string {
+	const visibility = scope === "global" ? "global" : `${scope}\0${sessionId}`;
+	return stableMemoryId(
+		`${memoryKind}\0${factType}\0${key}\0${observationIdentityText(value)}\0${visibility}`,
+		"",
+	);
+}
+
+function sameVisibility(scope: string, sessionId: string): { sql: string; params: string[] } {
+	if (scope === "global") return { sql: "scope = 'global'", params: [] };
+	return { sql: "(session_id = ? AND (scope IS NULL OR scope != 'global'))", params: [sessionId] };
 }
 
 function findCanonicalFact(
@@ -359,19 +367,26 @@ function findCanonicalFact(
 	key: string,
 	value: string,
 	factId: string,
+	scope: string,
+	sessionId: string,
 ): ObservationFactRow | null {
-	return (
+	const visibility = sameVisibility(scope, sessionId);
+	const row =
 		(beam.db
 			.query(
 				`SELECT fact_id, subject, predicate, object, confidence, sources_json, superseded_by, source_msg_id
 				 FROM facts
 				 WHERE memory_kind = ? AND predicate = ? AND subject = ? AND (fact_id = ? OR object = ?)
+				   AND ${visibility.sql}
 				 ORDER BY CASE WHEN fact_id = ? THEN 0 ELSE 1 END,
 				          CASE WHEN superseded_by IS NULL THEN 0 ELSE 1 END
 				 LIMIT 1`,
 			)
-			.get(memoryKind, factType, key, factId, value, factId) as ObservationFactRow | null) ?? null
-	);
+			.get(memoryKind, factType, key, factId, value, ...visibility.params, factId) as ObservationFactRow | null) ??
+		null;
+	if (row === null) return null;
+	if (observationIdentityText(row.object) !== observationIdentityText(value)) return null;
+	return row;
 }
 
 function strengthenCanonicalFact(
@@ -425,16 +440,20 @@ function explicitContradictions(
 	memoryKind: MemoryFactKind,
 	exceptId: string,
 	value: string,
+	scope: string,
+	sessionId: string,
 ): ObservationFactRow[] {
+	const visibility = sameVisibility(scope, sessionId);
 	const rows = beam.db
 		.query(
 			`SELECT fact_id, subject, predicate, object, confidence, sources_json, superseded_by, source_msg_id
 			 FROM facts
 			 WHERE predicate = ? AND subject = ? AND memory_kind = ? AND superseded_by IS NULL AND fact_id != ?
+			   AND ${visibility.sql}
 			 ORDER BY rowid DESC
 			 LIMIT 40`,
 		)
-		.all(factType, key, memoryKind, exceptId) as ObservationFactRow[];
+		.all(factType, key, memoryKind, exceptId, ...visibility.params) as ObservationFactRow[];
 	return rows.filter(row => classifyObservation(value, row.object) === "contradicts");
 }
 
@@ -460,8 +479,17 @@ function insertFactRows(
 
 	const evidence = evidenceSource(beam, sourceMemoryId);
 	const quote = context.trim() === "" ? value : context;
-	const canonicalId = canonicalFactId(memoryKind, factType, key, value);
-	const same = findCanonicalFact(beam, memoryKind, factType, key, value, canonicalId);
+	const canonicalId = canonicalFactId(memoryKind, factType, key, value, evidence.scope, sessionId);
+	const same = findCanonicalFact(
+		beam,
+		memoryKind,
+		factType,
+		key,
+		value,
+		canonicalId,
+		evidence.scope,
+		sessionId,
+	);
 	if (same !== null) {
 		if (evidence.fromSummary && same.superseded_by !== null) return;
 		strengthenCanonicalFact(
@@ -472,7 +500,16 @@ function insertFactRows(
 			same.superseded_by !== null && !evidence.fromSummary,
 		);
 		if (same.superseded_by !== null && !evidence.fromSummary) {
-			for (const old of explicitContradictions(beam, factType, key, memoryKind, same.fact_id, value)) {
+			for (const old of explicitContradictions(
+				beam,
+				factType,
+				key,
+				memoryKind,
+				same.fact_id,
+				value,
+				evidence.scope,
+				sessionId,
+			)) {
 				ageFact(beam, old, same.fact_id, evidence.sourceId, quote, value);
 			}
 		}
@@ -498,7 +535,16 @@ function insertFactRows(
 		],
 	);
 	if (inserted.changes === 0) {
-		const raced = findCanonicalFact(beam, memoryKind, factType, key, value, canonicalId);
+		const raced = findCanonicalFact(
+			beam,
+			memoryKind,
+			factType,
+			key,
+			value,
+			canonicalId,
+			evidence.scope,
+			sessionId,
+		);
 		if (raced === null || (evidence.fromSummary && raced.superseded_by !== null)) return;
 		strengthenCanonicalFact(
 			beam,
@@ -509,7 +555,16 @@ function insertFactRows(
 		);
 		return;
 	}
-	for (const old of explicitContradictions(beam, factType, key, memoryKind, canonicalId, value)) {
+	for (const old of explicitContradictions(
+		beam,
+		factType,
+		key,
+		memoryKind,
+		canonicalId,
+		value,
+		evidence.scope,
+		sessionId,
+	)) {
 		ageFact(beam, old, canonicalId, evidence.sourceId, quote, value);
 	}
 }
@@ -632,6 +687,12 @@ function consolidateKgFact(
 		}
 		if (!Object.hasOwn(SINGLE_VALUED_PREDICATES, cleanPredicate.toLowerCase())) return;
 		const winnerId = computeFactId(cleanSubject, cleanPredicate, cleanObject);
+		if (!evidence.fromSummary) {
+			consolidator.conn.run(
+				`UPDATE consolidated_facts SET superseded_by = NULL, updated_at = ? WHERE id = ? AND superseded_by IS NOT NULL`,
+				[isoNow(), winnerId],
+			);
+		}
 		const losers = beam.db
 			.query(
 				`SELECT id FROM consolidated_facts
@@ -705,11 +766,11 @@ function insertPreference(
 		.query(
 			`SELECT id, preference, sources_json, superseded_by, source_memory_id
 			 FROM memoria_preferences
-			 WHERE preference = ?
+			 WHERE preference = ? AND session_id = ?
 			 ORDER BY CASE WHEN superseded_by IS NULL THEN 0 ELSE 1 END, id DESC
 			 LIMIT 1`,
 		)
-		.get(preference) as ObservationPreferenceRow | null;
+		.get(preference, sourceSession(beam)) as ObservationPreferenceRow | null;
 	if (same !== null) {
 		if (evidence.fromSummary && same.superseded_by !== null) return;
 		const merged = mergeEvidenceSources(seededSources(same.sources_json, same.source_memory_id), evidence.sourceId);
@@ -744,11 +805,11 @@ function insertPreference(
 		.query(
 			`SELECT id, preference, sources_json, superseded_by, source_memory_id
 			 FROM memoria_preferences
-			 WHERE superseded_by IS NULL AND id != ?
+			 WHERE superseded_by IS NULL AND id != ? AND session_id = ?
 			 ORDER BY id DESC
 			 LIMIT 40`,
 		)
-		.all(Number(newId)) as ObservationPreferenceRow[];
+		.all(Number(newId), sourceSession(beam)) as ObservationPreferenceRow[];
 	for (const row of active) {
 		if (classifyObservation(preference, row.preference ?? "") !== "contradicts") continue;
 		beam.db.run(

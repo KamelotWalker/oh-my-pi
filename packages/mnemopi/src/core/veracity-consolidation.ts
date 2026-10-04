@@ -580,6 +580,16 @@ export function proofCountBoost(distinctSources: number): number {
 	return 1 + PROOF_COUNT_ALPHA * Math.log1p(extra);
 }
 
+/** Identity keeps symbols that distinguish claims (`C++` vs `C#`); classification may still ignore them. */
+export function observationIdentityText(text: string): string {
+	return text
+		.normalize("NFC")
+		.toLocaleLowerCase("tr")
+		.replace(/[^\p{L}\p{N}+#]+/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
 export function normalizeObservationText(text: string): string {
 	return text
 		.normalize("NFC")
@@ -662,16 +672,6 @@ export function classifyObservation(incoming: string, existing: string): Observa
 	const left = normalizeObservationText(incoming);
 	const right = normalizeObservationText(existing);
 	if (left === "" || right === "") return "distinct";
-	const leftTokens = observationTokens(left);
-	const rightTokens = observationTokens(right);
-	const leftNegated = leftTokens.some(token => Object.hasOwn(NEGATION_TOKENS, token));
-	const rightNegated = rightTokens.some(token => Object.hasOwn(NEGATION_TOKENS, token));
-	if (leftNegated !== rightNegated) {
-		return tokenJaccard(withoutNegation(leftTokens), withoutNegation(rightTokens)) >= 0.5
-			? "contradicts"
-			: "distinct";
-	}
-	if (left === right || sequencesEqual(leftTokens, rightTokens)) return "same";
 	const incomingFrame = preferenceFrame(incoming);
 	const existingFrame = preferenceFrame(existing);
 	if (
@@ -682,6 +682,16 @@ export function classifyObservation(incoming: string, existing: string): Observa
 	) {
 		return "contradicts";
 	}
+	const leftTokens = observationTokens(left);
+	const rightTokens = observationTokens(right);
+	const leftNegated = leftTokens.some(token => Object.hasOwn(NEGATION_TOKENS, token));
+	const rightNegated = rightTokens.some(token => Object.hasOwn(NEGATION_TOKENS, token));
+	if (leftNegated !== rightNegated) {
+		return tokenJaccard(withoutNegation(leftTokens), withoutNegation(rightTokens)) >= 0.5
+			? "contradicts"
+			: "distinct";
+	}
+	if (left === right || sequencesEqual(leftTokens, rightTokens)) return "same";
 	return "distinct";
 }
 
