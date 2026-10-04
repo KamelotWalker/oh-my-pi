@@ -1,7 +1,7 @@
 import { dirname } from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type * as MnemopiNs from "@oh-my-pi/pi-mnemopi";
-import type { Mnemopi, RecallResult } from "@oh-my-pi/pi-mnemopi";
+import type { Mnemopi, RecallEnhancedOptions, RecallResult, ReflectMemory, ReflectResult } from "@oh-my-pi/pi-mnemopi";
 import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
 import type { LocalModelInitializer } from "@oh-my-pi/pi-mnemopi/core";
 import { logger, toError } from "@oh-my-pi/pi-utils";
@@ -230,6 +230,11 @@ export interface MnemopiSessionStateOptions {
 	hasRecalledForFirstTurn?: boolean;
 }
 
+export interface MnemopiScopedReflection {
+	reflection: ReflectResult | null;
+	results: RecallResult[];
+}
+
 export class MnemopiSessionState {
 	sessionId: string;
 	readonly config: MnemopiBackendConfig;
@@ -399,7 +404,11 @@ export class MnemopiSessionState {
 		return lines.join("\n\n");
 	}
 
-	async collectScopedRecallResults(query: string): Promise<RecallResult[]> {
+	async collectScopedRecallResults(
+		query: string,
+		limit = this.config.recallLimit,
+		options: Pick<RecallEnhancedOptions, "contentPreviewChars"> = {},
+	): Promise<RecallResult[]> {
 		const merged: RecallResult[] = [];
 		const byId = new Map<string, number>();
 		const byContent = new Map<string, number>();
@@ -416,7 +425,8 @@ export class MnemopiSessionState {
 			let targetSucceeded = false;
 			try {
 				for (const recallQuery of queries) {
-					const results = await target.memory.recallEnhanced(recallQuery, this.config.recallLimit, {
+					const results = await target.memory.recallEnhanced(recallQuery, limit, {
+						...options,
 						includeFacts: true,
 						channelId: target.bank,
 					});
@@ -444,12 +454,53 @@ export class MnemopiSessionState {
 			);
 		}
 		merged.sort(compareRecallResults);
-		if (merged.length > this.config.recallLimit) merged.length = this.config.recallLimit;
+		if (merged.length > limit) merged.length = limit;
 		return merged;
 	}
 
 	recallResultsScoped(query: string): Promise<RecallResult[]> {
 		return this.collectScopedRecallResults(query);
+	}
+
+	async reflectScoped(query: string, signal?: AbortSignal): Promise<MnemopiScopedReflection> {
+		signal?.throwIfAborted();
+		const results = await this.collectScopedRecallResults(query, Math.max(this.config.recallLimit, 12), {
+			contentPreviewChars: 0,
+		});
+		signal?.throwIfAborted();
+		const memories: ReflectMemory[] = results.map(result => ({
+			id: result.id,
+			content: result.content,
+			timestamp: result.timestamp,
+			kind: result.memory_type ?? result.tier_label ?? result.tier,
+		}));
+		const complete = this.config.llmMode === "none" ? null : this.memory.runtimeOptions?.llm?.complete;
+		if (!complete || memories.length === 0) {
+			logger.debug("Mnemopi: reflection using recalled-memory fallback", {
+				bank: this.config.bank,
+				reason:
+					memories.length === 0
+						? "no-memories"
+						: this.config.llmMode === "none"
+							? "llm-disabled"
+							: "no-completion",
+			});
+			return { reflection: null, results: await this.#reflectionFallbackResults(results) };
+		}
+		const { synthesizeReflection } = await loadMnemopi();
+		const reflection = await synthesizeReflection(complete, query, memories, { signal });
+		return { reflection, results: reflection ? results : await this.#reflectionFallbackResults(results) };
+	}
+
+	async #reflectionFallbackResults(results: RecallResult[]): Promise<RecallResult[]> {
+		// The recall helper imports the embeddings stack; static loading would defeat
+		// this module's lazy Mnemopi boundary on CLI startup.
+		const { clipRecallContent } = await import("@oh-my-pi/pi-mnemopi/core/beam/recall");
+		return results.slice(0, this.config.recallLimit).map(result => {
+			const preview = clipRecallContent(result.content);
+			if (!preview.truncated) return result;
+			return { ...result, content: preview.content, truncated: preview.truncated, full_length: preview.fullLength };
+		});
 	}
 
 	formatScopedRecallContext(

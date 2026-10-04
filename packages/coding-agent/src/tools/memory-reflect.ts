@@ -52,17 +52,25 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 					const query = params.context?.trim()
 						? `${params.query.trim()}\n\nAdditional context:\n${params.context.trim()}`
 						: params.query;
-					const results = await state.recallResultsScoped(query);
+					const { reflection, results } = await state.reflectScoped(query, signal);
+					if (reflection) {
+						const citations = reflection.citedIds.map(id => `- memory://${id}`).join("\n");
+						const text = citations ? `${reflection.text}\n\nSources:\n${citations}` : reflection.text;
+						return {
+							content: [{ type: "text", text }],
+							details: { synthesized: reflection.synthesized, citedIds: reflection.citedIds },
+						};
+					}
 					if (results.length === 0) {
 						return {
 							content: [{ type: "text", text: "No relevant information found to reflect on." }],
-							details: {},
+							details: { synthesized: false, citedIds: [] },
 						};
 					}
 					const summary = state.formatContextScoped(results);
 					return {
 						content: [{ type: "text", text: `Based on recalled memories:\n\n${summary}` }],
-						details: {},
+						details: { synthesized: false, citedIds: [] },
 					};
 				} catch (err) {
 					logger.warn("reflect failed", { backend: "mnemopi", bank: state.config.bank, error: String(err) });

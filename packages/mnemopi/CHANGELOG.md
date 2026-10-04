@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added optional LLM reflection that answers questions from recalled memories with source citations.
+
 ## [18.5.1] - 2026-10-03
 
 ### Changed
