@@ -191,21 +191,36 @@ function deleteValidations(db: BeamMemoryState["db"], memoryIds: readonly string
 	db.run(`DELETE FROM memory_validations WHERE memory_id IN (${placeholders})`, [...memoryIds]);
 }
 
-function releaseSupersession(db: BeamMemoryState["db"], winnerIds: readonly string[]): void {
-	if (winnerIds.length === 0) return;
+/** Bypass removed winners without reviving an older claim while a successor survives. */
+function releaseSupersession(
+	db: BeamMemoryState["db"],
+	table: "facts" | "consolidated_facts" | "memoria_preferences",
+	winnerIds: readonly string[],
+): void {
+	if (winnerIds.length === 0 || !columnExists(db, table, "superseded_by")) return;
+	const idColumn = table === "facts" ? "fact_id" : "id";
 	const placeholders = winnerIds.map(() => "?").join(", ");
-	if (tableExists(db, "facts") && columnExists(db, "facts", "superseded_by")) {
-		db.run(`UPDATE facts SET superseded_by = NULL WHERE superseded_by IN (${placeholders})`, [...winnerIds]);
-	}
-	if (tableExists(db, "consolidated_facts")) {
-		db.run(`UPDATE consolidated_facts SET superseded_by = NULL WHERE superseded_by IN (${placeholders})`, [
-			...winnerIds,
-		]);
-	}
-	if (tableExists(db, "memoria_preferences") && columnExists(db, "memoria_preferences", "superseded_by")) {
-		db.run(`UPDATE memoria_preferences SET superseded_by = NULL WHERE superseded_by IN (${placeholders})`, [
-			...winnerIds,
-		]);
+	const rows = db
+		.query(`SELECT ${idColumn} AS id, superseded_by FROM ${table} WHERE ${idColumn} IN (${placeholders})`)
+		.all(...winnerIds) as { id: string | number; superseded_by: string | null }[];
+	const successors = new Map(rows.map(row => [String(row.id), row.superseded_by]));
+	for (const [removedId, successor] of successors) {
+		let next = successor;
+		const seen = new Set([removedId]);
+		while (next !== null && successors.has(next)) {
+			if (seen.has(next)) {
+				next = null;
+				break;
+			}
+			seen.add(next);
+			next = successors.get(next) ?? null;
+		}
+		if (next !== null && db.query(`SELECT 1 FROM ${table} WHERE ${idColumn} = ?`).get(next) === null) next = null;
+		db.run(
+			`UPDATE ${table} SET superseded_by = ?
+			 WHERE superseded_by = ? AND ${idColumn} NOT IN (${placeholders})`,
+			[next, removedId, ...winnerIds],
+		);
 	}
 }
 
@@ -218,8 +233,8 @@ function detachFactSources(db: BeamMemoryState["db"], ids: readonly string[], gr
 		}[];
 		const deletedIds = factRows.map(row => row.fact_id);
 		for (const factId of deletedIds) graphRefs.add(factId);
+		releaseSupersession(db, "facts", deletedIds);
 		db.run(`DELETE FROM facts WHERE source_msg_id IN (${placeholders})`, [...ids]);
-		releaseSupersession(db, deletedIds);
 		return;
 	}
 	const byId = new Map<string, { source_msg_id: string | null; sources_json: string | null }>();
@@ -248,7 +263,6 @@ function detachFactSources(db: BeamMemoryState["db"], ids: readonly string[], gr
 		if (remaining.length === 0) {
 			graphRefs.add(factId);
 			deleted.push(factId);
-			db.run("DELETE FROM facts WHERE fact_id = ?", [factId]);
 			continue;
 		}
 		const nextSource = remaining.find(source => !source.startsWith("session:")) ?? null;
@@ -260,8 +274,11 @@ function detachFactSources(db: BeamMemoryState["db"], ids: readonly string[], gr
 			factId,
 		]);
 	}
+	releaseSupersession(db, "facts", deleted);
+	if (deleted.length > 0) {
+		db.run(`DELETE FROM facts WHERE fact_id IN (${deleted.map(() => "?").join(", ")})`, deleted);
+	}
 	deleteValidations(db, deleted);
-	releaseSupersession(db, deleted);
 }
 
 function detachConsolidatedSources(db: BeamMemoryState["db"], ids: readonly string[]): void {
@@ -285,13 +302,15 @@ function detachConsolidatedSources(db: BeamMemoryState["db"], ids: readonly stri
 		const remaining = parseSourceList(row.sources_json).filter(source => !dropped.has(source));
 		if (remaining.length === 0) {
 			deleted.push(row.id);
-			db.run("DELETE FROM consolidated_facts WHERE id = ?", [row.id]);
 			continue;
 		}
 		db.run("UPDATE consolidated_facts SET sources_json = ? WHERE id = ?", [JSON.stringify(remaining), row.id]);
 	}
+	releaseSupersession(db, "consolidated_facts", deleted);
+	if (deleted.length > 0) {
+		db.run(`DELETE FROM consolidated_facts WHERE id IN (${deleted.map(() => "?").join(", ")})`, deleted);
+	}
 	deleteValidations(db, deleted);
-	releaseSupersession(db, deleted);
 }
 
 function detachPreferenceSources(db: BeamMemoryState["db"], ids: readonly string[]): void {
@@ -302,8 +321,8 @@ function detachPreferenceSources(db: BeamMemoryState["db"], ids: readonly string
 			.query(`SELECT id FROM memoria_preferences WHERE source_memory_id IN (${placeholders})`)
 			.all(...ids) as { id: number }[];
 		const deletedIds = rows.map(row => String(row.id));
+		releaseSupersession(db, "memoria_preferences", deletedIds);
 		db.run(`DELETE FROM memoria_preferences WHERE source_memory_id IN (${placeholders})`, [...ids]);
-		releaseSupersession(db, deletedIds);
 		return;
 	}
 	const byId = new Map<number, { source_memory_id: string | null; sources_json: string | null }>();
@@ -333,7 +352,6 @@ function detachPreferenceSources(db: BeamMemoryState["db"], ids: readonly string
 		const remaining = linkedSources.filter(source => !dropped.has(source));
 		if (remaining.length === 0) {
 			deletedIds.push(String(id));
-			db.run("DELETE FROM memoria_preferences WHERE id = ?", [id]);
 			continue;
 		}
 		const nextSource = remaining.find(source => !source.startsWith("session:")) ?? row.source_memory_id;
@@ -346,7 +364,10 @@ function detachPreferenceSources(db: BeamMemoryState["db"], ids: readonly string
 			id,
 		]);
 	}
-	releaseSupersession(db, deletedIds);
+	releaseSupersession(db, "memoria_preferences", deletedIds);
+	if (deletedIds.length > 0) {
+		db.run(`DELETE FROM memoria_preferences WHERE id IN (${deletedIds.map(() => "?").join(", ")})`, deletedIds);
+	}
 }
 
 /**

@@ -9,8 +9,8 @@ import { hasRetainableContent } from "../content-noise";
 import {
 	classifyObservation,
 	clampVeracity,
-	computeFactId,
 	mergeEvidenceSources,
+	normalizeObservationText,
 	observationIdentityText,
 	recordMemoryValidation,
 	SINGLE_VALUED_PREDICATES,
@@ -371,22 +371,21 @@ function findCanonicalFact(
 	sessionId: string,
 ): ObservationFactRow | null {
 	const visibility = sameVisibility(scope, sessionId);
-	const row =
-		(beam.db
-			.query(
-				`SELECT fact_id, subject, predicate, object, confidence, sources_json, superseded_by, source_msg_id
-				 FROM facts
-				 WHERE memory_kind = ? AND predicate = ? AND subject = ? AND (fact_id = ? OR object = ?)
-				   AND ${visibility.sql}
-				 ORDER BY CASE WHEN fact_id = ? THEN 0 ELSE 1 END,
-				          CASE WHEN superseded_by IS NULL THEN 0 ELSE 1 END
-				 LIMIT 1`,
-			)
-			.get(memoryKind, factType, key, factId, value, ...visibility.params, factId) as ObservationFactRow | null) ??
-		null;
-	if (row === null) return null;
-	if (observationIdentityText(row.object) !== observationIdentityText(value)) return null;
-	return row;
+	// Existing banks used an unscoped, punctuation-normalized id. Reuse that row
+	// only when its actual claim and visibility match; C++ and C# shared that id.
+	const legacyId = stableMemoryId(`${memoryKind}\0${factType}\0${key}\0${normalizeObservationText(value)}`, "");
+	const rows = beam.db
+		.query(
+			`SELECT fact_id, subject, predicate, object, confidence, sources_json, superseded_by, source_msg_id
+			 FROM facts
+			 WHERE memory_kind = ? AND predicate = ? AND subject = ? AND (fact_id IN (?, ?) OR object = ?)
+			   AND ${visibility.sql}
+			 ORDER BY CASE WHEN fact_id = ? THEN 0 ELSE 1 END,
+			          CASE WHEN superseded_by IS NULL THEN 0 ELSE 1 END`,
+		)
+		.all(memoryKind, factType, key, factId, legacyId, value, ...visibility.params, factId) as ObservationFactRow[];
+	const identity = observationIdentityText(value);
+	return rows.find(row => observationIdentityText(row.object) === identity) ?? null;
 }
 
 function strengthenCanonicalFact(
@@ -686,7 +685,8 @@ function consolidateKgFact(
 			});
 		}
 		if (!Object.hasOwn(SINGLE_VALUED_PREDICATES, cleanPredicate.toLowerCase())) return;
-		const winnerId = computeFactId(cleanSubject, cleanPredicate, cleanObject);
+		const winnerId = consolidated.id;
+		if (winnerId === null) return;
 		if (!evidence.fromSummary) {
 			consolidator.conn.run(
 				`UPDATE consolidated_facts SET superseded_by = NULL, updated_at = ? WHERE id = ? AND superseded_by IS NOT NULL`,
@@ -771,6 +771,7 @@ function insertPreference(
 			 LIMIT 1`,
 		)
 		.get(preference, sourceSession(beam)) as ObservationPreferenceRow | null;
+	let winnerId: string;
 	if (same !== null) {
 		if (evidence.fromSummary && same.superseded_by !== null) return;
 		const merged = mergeEvidenceSources(seededSources(same.sources_json, same.source_memory_id), evidence.sourceId);
@@ -783,24 +784,25 @@ function insertPreference(
 			 WHERE id = ?`,
 			[merged.sources.length, JSON.stringify(merged.sources), revive ? 1 : 0, same.id],
 		);
-		return;
+		if (!revive) return;
+		winnerId = String(same.id);
+	} else {
+		const inserted = beam.db.run(
+			`INSERT INTO memoria_preferences
+			 (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id, proof_count, sources_json)
+			 VALUES (?, ?, ?, ?, NULL, ?, ?, 1, ?)`,
+			[
+				sourceSession(beam),
+				messageIdx,
+				preference,
+				topic,
+				preference,
+				sourceMemoryId,
+				JSON.stringify([evidence.sourceId]),
+			],
+		);
+		winnerId = String(inserted.lastInsertRowid);
 	}
-
-	const inserted = beam.db.run(
-		`INSERT INTO memoria_preferences
-		 (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id, proof_count, sources_json)
-		 VALUES (?, ?, ?, ?, NULL, ?, ?, 1, ?)`,
-		[
-			sourceSession(beam),
-			messageIdx,
-			preference,
-			topic,
-			preference,
-			sourceMemoryId,
-			JSON.stringify([evidence.sourceId]),
-		],
-	);
-	const newId = String(inserted.lastInsertRowid);
 	const active = beam.db
 		.query(
 			`SELECT id, preference, sources_json, superseded_by, source_memory_id
@@ -809,12 +811,12 @@ function insertPreference(
 			 ORDER BY id DESC
 			 LIMIT 40`,
 		)
-		.all(Number(newId), sourceSession(beam)) as ObservationPreferenceRow[];
+		.all(Number(winnerId), sourceSession(beam)) as ObservationPreferenceRow[];
 	for (const row of active) {
 		if (classifyObservation(preference, row.preference ?? "") !== "contradicts") continue;
 		beam.db.run(
 			"UPDATE memoria_preferences SET superseded_by = ?, evolution = 'superseded' WHERE id = ? AND superseded_by IS NULL",
-			[newId, row.id],
+			[winnerId, row.id],
 		);
 	}
 }
@@ -1509,10 +1511,9 @@ export function sleep(beam: BeamMemoryState, dryRun = false): SleepResult {
 	for (const [source, items] of grouped) {
 		for (const chunk of splitSleepItems(beam, source, items)) {
 			const ids = chunk.items.map(item => rowValue(item, "id")).filter((id): id is string => id !== null);
-			let scope = "session";
+			const scope = chunk.items.every(item => rowValue(item, "scope") === "global") ? "global" : "session";
 			let validUntil: string | null = null;
 			for (const item of chunk.items) {
-				if (rowValue(item, "scope") === "global") scope = "global";
 				const itemValidUntil = rowValue(item, "valid_until");
 				if (itemValidUntil && (validUntil === null || itemValidUntil < validUntil)) validUntil = itemValidUntil;
 			}

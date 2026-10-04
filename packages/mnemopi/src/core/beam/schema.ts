@@ -406,6 +406,7 @@ export function initBeam(db: Database): void {
 		"CREATE INDEX IF NOT EXISTS idx_facts_session ON facts(session_id)",
 		"CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject)",
 		"CREATE INDEX IF NOT EXISTS idx_facts_source ON facts(source_msg_id)",
+		"CREATE INDEX IF NOT EXISTS idx_facts_canonical_lookup ON facts(predicate, subject, object, session_id, scope)",
 	]);
 	db.run(`
 		CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts USING fts5(

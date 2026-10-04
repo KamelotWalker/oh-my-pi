@@ -11,6 +11,7 @@
 
 - Stopped chatter and arbitrary prose from becoming facts through extraction fallback, including framed conversation input. Preserved Turkish declarative legacy output and completed items in truncated structured JSON without retaining unfinished items or schema text.
 - Fixed extracted facts with identical text overwriting each other's `world`/`experience` provenance, and preserved legitimate legacy facts containing phrases such as "no memories" or "no facts".
+- Fixed observation supersession chains losing their surviving winner after source deletion, legacy normalized fact IDs splitting evidence, and legacy KG IDs hiding both workplace claims on reconfirmation. Mixed-scope sleep summaries now retain the narrowest source visibility, and returning preferences correctly supersede their explicit negations.
 
 
 ## [18.5.1] - 2026-10-03
