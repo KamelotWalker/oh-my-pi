@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Mnemopi now distinguishes user/world facts from completed agent experiences, with separate extraction sources and semantic kind labels in recall results. ([#14314](https://github.com/can1357/oh-my-pi/pull/14314) by [@KamelotWalker](https://github.com/KamelotWalker))
+
+### Fixed
+
+- Prevented Turkish and English greeting-, thanks-, and acknowledgement-only sessions from being retained as memory episodes, including during shutdown. ([#14314](https://github.com/can1357/oh-my-pi/pull/14314) by [@KamelotWalker](https://github.com/KamelotWalker))
+- Redacted email addresses, Turkish phone numbers and identity numbers, IBANs, and payment card numbers with typed masks before memory writes. Added credential-prefix coverage and applied the same protection to separate extraction and embedding text. ([#14314](https://github.com/can1357/oh-my-pi/pull/14314) by [@KamelotWalker](https://github.com/KamelotWalker))
+- Fixed memory redaction missing nonuniform valid Turkish identity numbers and IBANs followed by ordinary prose, while preserving surrounding text and rejecting invalid checksums or account-number prefixes. ([#14314](https://github.com/can1357/oh-my-pi/pull/14314) by [@KamelotWalker](https://github.com/KamelotWalker))
+
 ## [18.6.2] - 2026-10-04
 
 ### Fixed
@@ -25,15 +35,6 @@
 - Fixed long `/btw` answers in Tern being clipped with no way to scroll: `/btw` now answers in the scrollable BTW history sheet ([#14331](https://github.com/can1357/oh-my-pi/pull/14331) by [@H4vC](https://github.com/H4vC))
 - Fixed `/btw` answers longer than 4 KiB being cut off with `[…truncated]` once they finished ([#14331](https://github.com/can1357/oh-my-pi/pull/14331) by [@H4vC](https://github.com/H4vC))
 - In Tern, Esc puts the BTW history sheet away while an answer keeps streaming (`/btw` reopens it); `x` cancels the answer ([#14331](https://github.com/can1357/oh-my-pi/pull/14331) by [@H4vC](https://github.com/H4vC))
-### Added
-
-- Mnemopi now distinguishes user/world facts from completed agent experiences, with separate extraction sources and semantic kind labels in recall results.
-
-### Fixed
-
-- Prevented Turkish and English greeting-, thanks-, and acknowledgement-only sessions from being retained as memory episodes, including during shutdown.
-- Redacted email addresses, Turkish phone numbers and identity numbers, IBANs, and payment card numbers with typed masks before memory writes. Added credential-prefix coverage and applied the same protection to separate extraction and embedding text.
-- Fixed memory redaction missing nonuniform valid Turkish identity numbers and IBANs followed by ordinary prose, while preserving surrounding text and rejecting invalid checksums or account-number prefixes.
 
 ## [18.6.0] - 2026-10-03
 
