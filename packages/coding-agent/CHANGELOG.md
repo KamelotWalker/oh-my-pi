@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `/stats` now shows this session's live provider quota (the same data as `/usage`) on the dashboard's Providers page, refreshed every minute from the cached usage path
+
 ### Fixed
 
 - Fixed follow-up hashline edits being rejected as anchored on lines "never displayed" after an earlier edit shifted those lines, when the replacement carries the anchored content; genuinely stale line numbers are still rejected ([#14254](https://github.com/can1357/oh-my-pi/pull/14254) by [@abilliontokens](https://github.com/abilliontokens)).

@@ -28,6 +28,7 @@ import {
 } from "./frustration";
 import { getGainDashboardStats } from "./gain-aggregator";
 import { statsLive } from "./live";
+import { getLiveUsage, LIVE_USAGE_TIMEOUT_MS, type StatsUsageProvider, setStatsUsageProvider } from "./live-usage";
 import {
 	prepareStatsPort,
 	recoverStatsPort,
@@ -226,6 +227,24 @@ export async function handleApi(req: Request): Promise<Response> {
 	if (path === "/api/stats/providers") {
 		const stats = await getProviderDashboardStats(range);
 		return Response.json(stats);
+	}
+
+	if (path === "/api/usage") {
+		try {
+			return Response.json(await getLiveUsage(req.signal));
+		} catch (error) {
+			if (error instanceof DOMException && error.name === "TimeoutError") {
+				return Response.json(
+					{ error: `Usage providers did not answer within ${LIVE_USAGE_TIMEOUT_MS / 1000}s` },
+					{ status: 504 },
+				);
+			}
+			logger.warn("Stats live usage fetch failed", { error: String(error) });
+			return Response.json(
+				{ error: `Usage fetch failed: ${error instanceof Error ? error.message : String(error)}` },
+				{ status: 502 },
+			);
+		}
 	}
 
 	if (path === "/api/stats/recent") {
@@ -480,6 +499,8 @@ let liveServers = 0;
 export interface StartServerOptions {
 	/** Host judge for the Frustration dashboard's judge runs; replaces any previously registered one. */
 	judge?: StatsJudgeProvider;
+	/** Host live-quota source for the Providers page; replaces any previously registered one. */
+	usage?: StatsUsageProvider;
 }
 
 export async function startServer(
@@ -488,6 +509,7 @@ export async function startServer(
 	options: StartServerOptions = {},
 ): Promise<StatsServerHandle> {
 	if (options.judge) setStatsJudgeProvider(options.judge);
+	if (options.usage) setStatsUsageProvider(options.usage);
 	const activeKey = `${hostname}:${port}`;
 	if (port !== 0) {
 		const active = activeServers.get(activeKey);

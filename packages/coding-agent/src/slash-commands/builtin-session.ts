@@ -27,6 +27,7 @@ import {
 	type StatsDashboardLaunchResult,
 } from "./helpers/stats-dashboard";
 import { StatsNotice } from "@oh-my-pi/pi-tui/overlays/stats-notice";
+import { collapseSharedUsageReports } from "@oh-my-pi/pi-tui/overlays/usage-display";
 import { handleTodoAcp } from "./helpers/todo";
 import { buildUsageReportText } from "./helpers/usage-report";
 import type { SlashCommandRuntime, SlashCommandSpec } from "./types";
@@ -185,7 +186,8 @@ async function handleSessionPinCommand(
 /**
  * Start (or reuse) the stats dashboard for this session. The Frustration page
  * judges through this session's settings and registry; its cost lands on this
- * session's ledger.
+ * session's ledger. The Providers page's live quota reads this session's
+ * cached `/usage` path, so dashboard polls never force a provider refresh.
  */
 function launchSessionStatsDashboard(
 	args: StatsDashboardArgs,
@@ -200,7 +202,13 @@ function launchSessionStatsDashboard(
 		telemetry: owner.session.agent.telemetry,
 		cache: sharedJudgmentCache(),
 	});
-	return launchStatsDashboard(args, async () => judge);
+	return launchStatsDashboard(args, {
+		judge: async () => judge,
+		usage: async signal => {
+			const reports = await owner.session.fetchUsageReports(signal);
+			return reports && collapseSharedUsageReports(reports);
+		},
+	});
 }
 
 export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [

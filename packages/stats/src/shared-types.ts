@@ -527,6 +527,42 @@ export interface ProviderWindowStats {
 	windowInsights: ProviderWindowInsight[];
 	usageSeries: UsageWindowSeries[];
 }
+
+/**
+ * One live provider quota limit (client-safe mirror of pi-ai's `UsageLimit`).
+ * `amount.usedFraction` is always resolved server-side when the provider
+ * reported any usable amount, so the client never re-derives it.
+ */
+export interface LiveUsageLimit {
+	id: string;
+	label: string;
+	scope: { provider: string; accountId?: string; projectId?: string; tier?: string; windowId?: string };
+	window?: { id: string; label: string; durationMs?: number; resetsAt?: number; resetLabel?: string };
+	amount: { used?: number; limit?: number; remaining?: number; usedFraction?: number; unit: string };
+	status?: "ok" | "warning" | "exhausted" | "unknown";
+	notes?: string[];
+}
+
+/** One provider account's live quota report, without the provider's raw payload. */
+export interface LiveUsageReport {
+	provider: string;
+	fetchedAt: number;
+	limits: LiveUsageLimit[];
+	notes?: string[];
+	metadata?: Record<string, unknown>;
+}
+
+/**
+ * Live quota payload (`GET /api/usage`), served from the host session's cached
+ * `/usage` path. `available` is false when no host provider is registered
+ * (standalone `omp-stats`) or the host has no usage reporting configured.
+ */
+export interface LiveUsageResponse {
+	available: boolean;
+	reports: LiveUsageReport[];
+	/** Newest `fetchedAt` across reports (data age, not request time); null without reports. */
+	fetchedAt: number | null;
+}
 /**
  * One row of the Traces session list: a root session with every child
  * transcript (task subagents, advisors) folded in.

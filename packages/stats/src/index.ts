@@ -22,6 +22,7 @@ export { closeDb } from "./db";
 export { refreshRollups } from "./rollup";
 export type { StatsJudge, StatsJudgeProvider } from "./frustration";
 export { getGainDashboardStats } from "./gain-aggregator";
+export type { StatsUsageProvider } from "./live-usage";
 export { formatStatsDashboardUrl, type StartServerOptions, startServer } from "./server";
 export type { GainDashboardStats, GainSource, GainSourceTotals, GainTimeSeriesPoint } from "./shared-types";
 export type {

@@ -6,6 +6,7 @@ import type {
 	FrustrationJobStatus,
 	GainDashboardStats,
 	LiveStatus,
+	LiveUsageResponse,
 	MessageStats,
 	ModelDashboardStats,
 	OverviewStats,
@@ -174,6 +175,11 @@ export async function getProviderWindowStats(
 	const params = new URLSearchParams({ range });
 	if (provider !== null) params.set("provider", provider);
 	return fetchJson<ProviderWindowStats>(`${API_BASE}/stats/provider-windows?${params}`, { signal });
+}
+
+/** Live provider quota from the host session's cached `/usage` path. */
+export async function getLiveUsage(signal?: AbortSignal): Promise<LiveUsageResponse> {
+	return fetchJson<LiveUsageResponse>(`${API_BASE}/usage`, { signal });
 }
 
 export async function getSessions(limit = 100, q?: string, signal?: AbortSignal): Promise<SessionSummary[]> {

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a Live quota panel to the Providers page showing each provider account's current limits, usage, status and reset countdown when the dashboard is opened from an omp session (`/stats`)
+
 ## [18.6.0] - 2026-10-03
 
 ### Fixed

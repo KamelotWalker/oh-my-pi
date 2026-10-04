@@ -1,6 +1,7 @@
 import { format } from "@oh-my-pi/pi-utils/dates";
+import { formatDuration } from "@oh-my-pi/pi-utils/format";
 import { type ReactNode, useMemo, useState } from "react";
-import { getProviderDashboardStats, getProviderWindowStats } from "../api";
+import { getLiveUsage, getProviderDashboardStats, getProviderWindowStats } from "../api";
 import { Chart, type ChartSeries, Legend, ShareBar, TimeChart, useHiddenSeries } from "../charts";
 import { buildColorLookup, OTHER_COLOR, SERIES_COLORS } from "../data/colors";
 import {
@@ -11,12 +12,15 @@ import {
 	formatInteger,
 	formatPercent,
 	formatRelativeTime,
+	formatTimestamp,
 	formatTokensPerSecond,
 } from "../data/formatters";
 import { type QueryResult, useQuery } from "../data/query";
 import { bucketAxis, formatBucket, formatTick, rangeMeta } from "../data/range";
 import { densify, pivotSeries } from "../data/series";
 import type {
+	LiveUsageReport,
+	LiveUsageResponse,
 	ProviderAggregate,
 	ProviderHourlyPoint,
 	ProviderWindowInsight,
@@ -93,6 +97,7 @@ export function ProvidersRoute({ active, range }: ProvidersRouteProps) {
 		() => getProviderWindowStats(range, selectedProvider),
 		{ enabled: active && selectedProvider !== null },
 	);
+	const liveUsage = useQuery(["live-usage"], () => getLiveUsage(), { enabled: active, pollMs: LIVE_USAGE_POLL_MS });
 
 	const view = useMemo(() => {
 		const providers = stats.data?.providers ?? [];
@@ -147,6 +152,8 @@ export function ProvidersRoute({ active, range }: ProvidersRouteProps) {
 				title="Providers"
 				description={`Burn, reliability and subscription headroom per provider over ${meta.windowLabel}.`}
 			/>
+
+			<LiveQuotaCard usage={liveUsage} />
 
 			<QueryView query={stats} skeleton={<ChartSkeleton height={112} />}>
 				{({ providers }) => (
@@ -285,6 +292,186 @@ function resolveWindow(insights: readonly ProviderWindowInsight[], picked: Windo
 		);
 	return fallback ? { provider: fallback.provider, windowKey: fallback.windowKey } : null;
 }
+
+// ---------------------------------------------------------------------------
+// Live quota
+// ---------------------------------------------------------------------------
+
+/** Live quota is served from the host's usage cache, so polling it stays cheap. */
+const LIVE_USAGE_POLL_MS = 60_000;
+
+type LiveSeverity = "exhausted" | "high" | "ok" | "unknown";
+
+const LIVE_SEVERITY_RANK: Record<LiveSeverity, number> = { unknown: -1, ok: 0, high: 1, exhausted: 2 };
+
+interface LiveQuotaRow {
+	key: string;
+	provider: string;
+	account: string;
+	limit: string;
+	window: string | null;
+	fraction: number | null;
+	severity: LiveSeverity;
+	resetsAt: number | null;
+	resetLabel: string;
+}
+
+function metadataString(report: LiveUsageReport, key: string): string | undefined {
+	const value = report.metadata?.[key];
+	return typeof value === "string" && value ? value : undefined;
+}
+
+/** One row per (account, limit), labelled like `/usage`: email, account id, then project id. */
+function buildLiveQuotaRows(reports: readonly LiveUsageReport[]): LiveQuotaRow[] {
+	const rows: LiveQuotaRow[] = [];
+	const accountsSeen = new Map<string, number>();
+	for (const report of reports) {
+		const accountIndex = accountsSeen.get(report.provider) ?? 0;
+		accountsSeen.set(report.provider, accountIndex + 1);
+		const org = metadataString(report, "orgName") ?? metadataString(report, "orgId");
+		for (const limit of report.limits) {
+			const identity =
+				metadataString(report, "email") ?? metadataString(report, "accountId") ?? limit.scope.accountId;
+			const account = identity
+				? org && org !== identity
+					? `${identity} (${org})`
+					: identity
+				: (metadataString(report, "projectId") ?? limit.scope.projectId ?? `account ${accountIndex + 1}`);
+			const tier = limit.scope.tier;
+			const label =
+				tier && !limit.label.toLowerCase().includes(tier.toLowerCase()) ? `${limit.label} (${tier})` : limit.label;
+			const windowLabel = limit.window?.label;
+			const window =
+				windowLabel &&
+				windowLabel.toLowerCase() !== "quota window" &&
+				!label.toLowerCase().includes(windowLabel.toLowerCase())
+					? windowLabel
+					: null;
+			const fraction = limit.amount.usedFraction ?? null;
+			const severity: LiveSeverity =
+				limit.status === "exhausted" || (fraction ?? 0) >= 1
+					? "exhausted"
+					: limit.status === "warning" || (fraction ?? 0) >= 0.8
+						? "high"
+						: fraction === null && limit.status !== "ok"
+							? "unknown"
+							: "ok";
+			rows.push({
+				key: `${report.provider}::${account}::${limit.id}`,
+				provider: report.provider,
+				account,
+				limit: label,
+				window,
+				fraction,
+				severity,
+				resetsAt: limit.window?.resetsAt ?? null,
+				resetLabel: limit.window?.resetLabel ?? "resets",
+			});
+		}
+	}
+	return rows;
+}
+
+function LiveQuotaCard({ usage }: { usage: QueryResult<LiveUsageResponse> }) {
+	const rows = useMemo(() => buildLiveQuotaRows(usage.data?.reports ?? []), [usage.data]);
+	// Standalone `omp-stats` (no host session) and hosts without usage reporting hide the panel.
+	if (usage.data ? !usage.data.available : usage.error === null) return null;
+	const fetchedAt = usage.data?.fetchedAt ?? null;
+	return (
+		<Card
+			index={1}
+			title="Live quota"
+			description={`Current provider limits from this session's /usage cache${fetchedAt === null ? "" : `, fetched ${formatRelativeTime(fetchedAt)}`}. Refreshes every minute.`}
+			flush
+			stale={usage.stale}
+		>
+			<QueryView query={usage} skeleton={<TableSkeleton rows={3} />}>
+				{() => (
+					<Table
+						rows={rows}
+						rowKey={r => r.key}
+						columns={LIVE_QUOTA_COLUMNS}
+						initialSort={{ key: "used", dir: "desc" }}
+						limit={12}
+						empty={<EmptyState title="No provider reported quota limits" />}
+					/>
+				)}
+			</QueryView>
+		</Card>
+	);
+}
+
+const LIVE_QUOTA_COLUMNS: Column<LiveQuotaRow>[] = [
+	{
+		key: "account",
+		header: "Account",
+		sort: r => `${r.provider} ${r.account}`,
+		render: r => (
+			<LabelCell
+				primary={
+					<span className="truncate providers-account" title={r.account}>
+						{r.account}
+					</span>
+				}
+				secondary={<span className="mono">{r.provider}</span>}
+			/>
+		),
+	},
+	{
+		key: "limit",
+		header: "Limit",
+		sort: r => r.limit,
+		render: r => <LabelCell primary={r.limit} secondary={r.window ?? undefined} />,
+	},
+	{
+		key: "used",
+		header: "Used",
+		align: "right",
+		sort: r => r.fraction ?? -1,
+		render: r =>
+			r.fraction !== null ? (
+				<MeterCell
+					value={Math.min(r.fraction, 1)}
+					max={1}
+					display={formatPercent(r.fraction, 0)}
+					color={r.severity === "exhausted" ? "var(--bad)" : r.severity === "high" ? "var(--warn)" : "var(--ok)"}
+				/>
+			) : (
+				<span className="dim">–</span>
+			),
+	},
+	{
+		key: "status",
+		header: "Status",
+		sort: r => LIVE_SEVERITY_RANK[r.severity],
+		render: r =>
+			r.severity === "exhausted" ? (
+				<Badge tone="bad">Exhausted</Badge>
+			) : r.severity === "high" ? (
+				<Badge tone="warn">High</Badge>
+			) : r.severity === "ok" ? (
+				<Badge tone="ok">OK</Badge>
+			) : (
+				<span className="dim">Unknown</span>
+			),
+	},
+	{
+		key: "resets",
+		header: "Resets",
+		align: "right",
+		sort: r => r.resetsAt ?? Number.POSITIVE_INFINITY,
+		render: r => {
+			const remaining = r.resetsAt === null ? 0 : r.resetsAt - Date.now();
+			return remaining > 0 ? (
+				<span className="muted" title={formatTimestamp(r.resetsAt ?? 0)}>
+					{r.resetLabel} in {formatDuration(remaining)}
+				</span>
+			) : (
+				<span className="dim">–</span>
+			);
+		},
+	},
+];
 
 // ---------------------------------------------------------------------------
 // Provider totals
