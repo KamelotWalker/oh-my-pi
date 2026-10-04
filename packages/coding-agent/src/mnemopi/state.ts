@@ -407,7 +407,7 @@ export class MnemopiSessionState {
 	async collectScopedRecallResults(
 		query: string,
 		limit = this.config.recallLimit,
-		options: Pick<RecallEnhancedOptions, "contentPreviewChars"> = {},
+		options: Pick<RecallEnhancedOptions, "contentPreviewChars" | "updateRecallCounts"> = {},
 	): Promise<RecallResult[]> {
 		const merged: RecallResult[] = [];
 		const byId = new Map<string, number>();
@@ -462,45 +462,50 @@ export class MnemopiSessionState {
 		return this.collectScopedRecallResults(query);
 	}
 
+	/**
+	 * Opt-in synthesis reads full candidates without counting them as recalled.
+	 * Only cited sources are counted on success; fallback reruns the original
+	 * recall limit so a wider synthesis ranking cannot change the displayed result.
+	 * Disabled or unavailable synthesis uses the unmodified legacy recall path.
+	 */
 	async reflectScoped(query: string, signal?: AbortSignal): Promise<MnemopiScopedReflection> {
 		signal?.throwIfAborted();
+		const complete = this.config.llmMode === "none" ? null : this.memory.runtimeOptions?.llm?.complete;
+		if (!this.config.reflectSynthesis || !complete) {
+			return { reflection: null, results: await this.recallResultsScoped(query) };
+		}
 		const results = await this.collectScopedRecallResults(query, Math.max(this.config.recallLimit, 12), {
 			contentPreviewChars: 0,
+			updateRecallCounts: false,
 		});
 		signal?.throwIfAborted();
+		if (results.length === 0) return { reflection: null, results };
 		const memories: ReflectMemory[] = results.map(result => ({
 			id: result.id,
 			content: result.content,
 			timestamp: result.timestamp,
 			kind: result.memory_type ?? result.tier_label ?? result.tier,
 		}));
-		const complete = this.config.llmMode === "none" ? null : this.memory.runtimeOptions?.llm?.complete;
-		if (!complete || memories.length === 0) {
-			logger.debug("Mnemopi: reflection using recalled-memory fallback", {
-				bank: this.config.bank,
-				reason:
-					memories.length === 0
-						? "no-memories"
-						: this.config.llmMode === "none"
-							? "llm-disabled"
-							: "no-completion",
-			});
-			return { reflection: null, results: await this.#reflectionFallbackResults(results) };
-		}
 		const { synthesizeReflection } = await loadMnemopi();
 		const reflection = await synthesizeReflection(complete, query, memories, { signal });
-		return { reflection, results: reflection ? results : await this.#reflectionFallbackResults(results) };
+		signal?.throwIfAborted();
+		if (reflection) {
+			const citedIds = new Set(reflection.citedIds);
+			this.#recordReflectionRecallUsage(results.filter(result => citedIds.has(result.id)));
+			return { reflection, results };
+		}
+		const fallback = await this.collectScopedRecallResults(query, this.config.recallLimit, {
+			updateRecallCounts: false,
+		});
+		signal?.throwIfAborted();
+		this.#recordReflectionRecallUsage(fallback);
+		return { reflection: null, results: fallback };
 	}
 
-	async #reflectionFallbackResults(results: RecallResult[]): Promise<RecallResult[]> {
-		// The recall helper imports the embeddings stack; static loading would defeat
-		// this module's lazy Mnemopi boundary on CLI startup.
-		const { clipRecallContent } = await import("@oh-my-pi/pi-mnemopi/core/beam/recall");
-		return results.slice(0, this.config.recallLimit).map(result => {
-			const preview = clipRecallContent(result.content);
-			if (!preview.truncated) return result;
-			return { ...result, content: preview.content, truncated: preview.truncated, full_length: preview.fullLength };
-		});
+	#recordReflectionRecallUsage(results: readonly RecallResult[]): void {
+		for (const target of this.scoped.recall) {
+			target.memory.beam.recordRecallUsage(results, { channelId: target.bank });
+		}
 	}
 
 	formatScopedRecallContext(

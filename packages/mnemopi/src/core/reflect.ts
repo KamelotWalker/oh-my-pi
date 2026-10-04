@@ -1,16 +1,39 @@
 import { logger, withTimeout } from "@oh-my-pi/pi-utils";
 import type { MnemopiLlmCompletion } from "./runtime-options";
 
+/**
+ * Caller-selected evidence for reflection, supplied in descending relevance order.
+ * The helper does not recall or re-rank memories; earlier entries take priority
+ * when the serialized input budget is exhausted.
+ */
 export interface ReflectMemory {
+	/** Stable source identifier used verbatim in `[id]` citations. */
 	id: string;
+	/** Source text; may be truncated to fit the input budget. */
 	content: string;
+	/** Optional source timestamp, passed through as metadata without sorting. */
 	timestamp?: string | null;
+	/** Optional memory category, passed through as metadata. */
 	kind?: string | null;
 }
 
+/**
+ * An accepted LLM reflection, not the caller's recalled-memory fallback.
+ * Citation validation checks source identity, not whether each claim follows
+ * from the source text.
+ */
 export interface ReflectResult {
+	/** Trimmed completion text with recognized fabricated citation IDs removed. */
 	text: string;
+	/**
+	 * Unique validated IDs in first-citation order, restricted to memories actually
+	 * included in the bounded input. Empty only for an accepted uncited uncertainty answer.
+	 */
 	citedIds: string[];
+	/**
+	 * Always true for results returned by {@link synthesizeReflection}: the answer
+	 * has at least one validated citation or is an explicit uncited uncertainty answer.
+	 */
 	synthesized: boolean;
 }
 
@@ -102,9 +125,13 @@ function citationIdMatcher(ids: ReadonlySet<string>): (value: string) => boolean
 	};
 }
 
-function cleanCitations(raw: string, ids: ReadonlySet<string>): { text: string; citedIds: string[] } {
+function cleanCitations(
+	raw: string,
+	ids: ReadonlySet<string>,
+): { text: string; citedIds: string[]; hasCitationAttempt: boolean } {
 	const resemblesId = citationIdMatcher(ids);
 	const citedIds = new Set<string>();
+	let hasCitationAttempt = false;
 	const text = raw.replace(
 		/([ \t]*)\[([^[\]\r\n]+)\]([ \t]*)/g,
 		(match, before: string, content: string, after: string, offset: number) => {
@@ -113,6 +140,7 @@ function cleanCitations(raw: string, ids: ReadonlySet<string>): { text: string; 
 			if (next === "(") return match;
 			const parts = content.split(/[,;]/).map(part => part.trim());
 			if (!parts.every(part => ids.has(part) || resemblesId(part))) return match;
+			hasCitationAttempt = true;
 			const known = parts.filter(part => ids.has(part));
 			for (const id of known) citedIds.add(id);
 			if (known.length === parts.length) return match;
@@ -122,10 +150,54 @@ function cleanCitations(raw: string, ids: ReadonlySet<string>): { text: string; 
 			return before && after ? " " : before || after;
 		},
 	);
-	return { text: text.trim(), citedIds: [...citedIds] };
+	return { text: text.trim(), citedIds: [...citedIds], hasCitationAttempt };
 }
 
-/** Answer from recalled memories, or let the caller retain its non-LLM fallback. */
+function isUncitedUncertainty(text: string): boolean {
+	// Match the entire answer, never just an uncertainty preface to unsupported claims.
+	const normalized = text
+		.toLowerCase()
+		.replace(/i\u0307/g, "i")
+		.replace(/’/g, "'")
+		.replace(/\s+/g, " ");
+	return /^(?:i (?:don't|do not) know|not enough information|there is no information about this|bilmiyorum|bu konuda (?:yeterli )?bilgi yok|yeterli bilgi yok)[.!?]?$/.test(
+		normalized,
+	);
+}
+
+/**
+ * Synthesizes an answer from caller-selected memories, or returns null so the
+ * caller can retain its non-LLM fallback.
+ *
+ * @remarks
+ * Memories are serialized in caller order without recall or re-ranking. The JSON
+ * input is capped at 12,000 UTF-16 code units, including escaping and metadata;
+ * the serialized query string is capped at 3,000. Memory content may be truncated.
+ * Packing stops at the first truncated entry or entry whose metadata does not fit,
+ * and omitted IDs cannot validate citations.
+ *
+ * Recognized citation attempts with no validated IDs always produce null, even
+ * if removing them leaves an uncertainty statement. Mixed valid and fabricated
+ * citations retain the valid IDs and remove the fabricated ones. With no citation
+ * attempts, an uncited answer is accepted only when its entire text is one of:
+ * "I don't know", "I do not know", "Not enough information",
+ * "There is no information about this", "Bilmiyorum", "Bu konuda bilgi yok",
+ * "Bu konuda yeterli bilgi yok", or "Yeterli bilgi yok". Matching ignores case,
+ * repeated whitespace and straight versus curly apostrophes, and permits one
+ * optional trailing `.`, `!` or `?`. Additional claims are not accepted.
+ *
+ * @param complete - Host completion callback, responsible for the reflection
+ * system prompt; receives JSON source data and the `memory-reflect` task.
+ * @param query - The caller's reflection question, truncated to the query budget.
+ * @param memories - Relevant source memories, highest priority first.
+ * @param opts - Output token limit (default 2,048) and optional cancellation signal.
+ * Completion uses temperature zero and a 15-second timeout.
+ * @returns An accepted result with `synthesized: true`, at least one validated
+ * citation or explicit uncited uncertainty; null when completion is unavailable,
+ * no memories fit, completion fails or times out, output is null or empty, all
+ * attempted citations are invalid, or an uncited answer is not explicit uncertainty.
+ * @throws The cancellation reason when aborted; cancellation never becomes fallback.
+ */
 export async function synthesizeReflection(
 	complete: MnemopiLlmCompletion | null | undefined,
 	query: string,
@@ -168,9 +240,15 @@ export async function synthesizeReflection(
 			return null;
 		}
 
-		const { text, citedIds } = cleanCitations(raw, ids);
+		const { text, citedIds, hasCitationAttempt } = cleanCitations(raw, ids);
 		if (text === "") {
 			logger.debug("mnemopi reflection falling back", { reason: "no_text_after_citation_cleanup" });
+			return null;
+		}
+		if (citedIds.length === 0 && (hasCitationAttempt || !isUncitedUncertainty(text))) {
+			logger.debug("mnemopi reflection falling back", {
+				reason: hasCitationAttempt ? "no_valid_citations" : "unsupported_uncited_answer",
+			});
 			return null;
 		}
 		return { text, citedIds, synthesized: true };

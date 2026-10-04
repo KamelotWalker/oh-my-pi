@@ -4,7 +4,11 @@
 
 ### Added
 
-- Added optional LLM reflection that answers questions from recalled memories with source citations.
+- Added optional LLM reflection that answers questions from recalled memories with source citations; the coding-agent integration is opt-in via `mnemopi.reflectSynthesis` (default `false`) ([#14378](https://github.com/can1357/oh-my-pi/pull/14378) by [@KamelotWalker](https://github.com/KamelotWalker)).
+
+### Fixed
+
+- Fixed reflection accepting unsupported uncited claims or answers whose attempted memory citations are all invalid; these now use the recalled-memory fallback ([#14378](https://github.com/can1357/oh-my-pi/pull/14378) by [@KamelotWalker](https://github.com/KamelotWalker)).
 
 ## [18.5.1] - 2026-10-03
 

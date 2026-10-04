@@ -64,13 +64,13 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 					if (results.length === 0) {
 						return {
 							content: [{ type: "text", text: "No relevant information found to reflect on." }],
-							details: { synthesized: false, citedIds: [] },
+							details: {},
 						};
 					}
 					const summary = state.formatContextScoped(results);
 					return {
 						content: [{ type: "text", text: `Based on recalled memories:\n\n${summary}` }],
-						details: { synthesized: false, citedIds: [] },
+						details: {},
 					};
 				} catch (err) {
 					logger.warn("reflect failed", { backend: "mnemopi", bank: state.config.bank, error: String(err) });

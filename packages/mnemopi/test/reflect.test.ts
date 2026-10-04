@@ -26,12 +26,73 @@ describe("memory reflection", () => {
 		});
 	});
 
-	it("retains an answer with no valid citations without inventing source ids", async () => {
-		expect(await synthesizeReflection(() => "Not enough information [memory-missing].", "Where?", memories)).toEqual({
-			text: "Not enough information.",
+	it("rejects an unsupported ownership claim after its fabricated citation is removed", async () => {
+		expect(
+			await synthesizeReflection(() => "Alice owns the checklist [memory-missing].", "Who owns the checklist?", [
+				{ id: "memory-a", content: "Mina owns the checklist" },
+			]),
+		).toBeNull();
+	});
+
+	it("allows fallback when every citation in grouped and separate references is invalid", async () => {
+		expect(
+			await synthesizeReflection(
+				() => "Alice owns it [memory-missing, memory-invented]. Bob approves it [memory-other].",
+				"Who owns the checklist?",
+				memories,
+			),
+		).toBeNull();
+	});
+
+	it("rejects uncertainty with attempted citations when none validate", async () => {
+		expect(
+			await synthesizeReflection(() => "Not enough information [memory-missing].", "Where?", memories),
+		).toBeNull();
+	});
+
+	it("allows fallback for factual assertions with no citations", async () => {
+		expect(
+			await synthesizeReflection(() => "Alice owns the checklist.", "Who owns the checklist?", memories),
+		).toBeNull();
+	});
+
+	it("accepts an explicit uncited English unknown answer without inventing source ids", async () => {
+		expect(await synthesizeReflection(() => "I don't know", "Where?", memories)).toEqual({
+			text: "I don't know",
 			citedIds: [],
 			synthesized: true,
 		});
+	});
+
+	it("accepts an explicit uncited Turkish lack-of-information answer", async () => {
+		expect(await synthesizeReflection(() => "bu konuda bilgi yok", "Nerede?", memories)).toEqual({
+			text: "bu konuda bilgi yok",
+			citedIds: [],
+			synthesized: true,
+		});
+	});
+
+	it("normalizes curly apostrophes, whitespace and case only for uncertainty recognition", async () => {
+		expect(await synthesizeReflection(() => " \nI \t DON’T KNOW?\n ", "Where?", memories)).toEqual({
+			text: "I \t DON’T KNOW?",
+			citedIds: [],
+			synthesized: true,
+		});
+	});
+
+	it("recognizes Turkish uppercase dotted I in an uncertainty answer", async () => {
+		expect(await synthesizeReflection(() => "BU KONUDA BİLGİ YOK!", "Nerede?", memories)).toEqual({
+			text: "BU KONUDA BİLGİ YOK!",
+			citedIds: [],
+			synthesized: true,
+		});
+	});
+
+	it("rejects unsupported claims appended to English or Turkish uncertainty", async () => {
+		expect(
+			await synthesizeReflection(() => "I don't know. Alice owns the checklist.", "Who owns it?", memories),
+		).toBeNull();
+		expect(await synthesizeReflection(() => "Bu konuda bilgi yok, sahibi Alice.", "Kimin?", memories)).toBeNull();
 	});
 
 	it("preserves Markdown links, checkboxes, numbered references and array indexing", async () => {

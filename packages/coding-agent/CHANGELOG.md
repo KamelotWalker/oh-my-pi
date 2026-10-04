@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in Mnemopi `reflect` synthesis with cited memory sources via `mnemopi.reflectSynthesis` (default `false`); disabled or unavailable completions retain the original recalled-memory behavior ([#14378](https://github.com/can1357/oh-my-pi/pull/14378) by [@KamelotWalker](https://github.com/KamelotWalker)).
+
+### Fixed
+
+- Fixed memory completions timing out prematurely instead of honoring their configured timeout ([#14378](https://github.com/can1357/oh-my-pi/pull/14378) by [@KamelotWalker](https://github.com/KamelotWalker)).
+- Fixed opt-in reflection counting uncited or undisplayed memories as recalled, changing fallback rankings when collecting broader synthesis evidence, and invalidating enhanced-recall caches during usage accounting ([#14378](https://github.com/can1357/oh-my-pi/pull/14378) by [@KamelotWalker](https://github.com/KamelotWalker)).
+
 ## [18.6.2] - 2026-10-04
 
 ### Fixed
@@ -9,13 +18,6 @@
 - Fixed snapcompact's short final frames preventing vision-backed sessions from continuing on backends that reject 32px-or-smaller images ([#14355](https://github.com/can1357/oh-my-pi/issues/14355)).
 - Fixed the agent's `goal` calls asking for approval under `--approval-mode write`, which paused goal-mode loops at `complete`; `always-ask` still prompts for goal changes but not `get` ([#14368](https://github.com/can1357/oh-my-pi/issues/14368))
 - Fixed MCP server connection progress popping up a toast for every server that connects or fails in native terminals such as Tern; it now shows only in the classic terminal transcript
-### Added
-
-- Mnemopi's `reflect` tool now synthesizes concise answers with memory citations using the session's configured completion; disabled or unavailable completions, including remote configurations without a completion callback, keep the recalled-memory fallback.
-
-### Fixed
-
-- Fixed memory completions timing out prematurely instead of honoring their configured timeout.
 
 ## [18.6.1] - 2026-10-04
 
