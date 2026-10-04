@@ -123,6 +123,33 @@ describe("memory secret redaction", () => {
 		expect(options).toBeUndefined();
 	});
 
+	it("redacts nonuniform TCKNs using the tenth and eleventh digit checks independently", () => {
+		expect(redactMemorySecrets("id 10000000146")).toBe("id [REDACTED:tckn]");
+		// The odd/even expression is negative before modulo normalization.
+		expect(redactMemorySecrets("id 19090909018")).toBe("id [REDACTED:tckn]");
+		// The first checksum is wrong even though the final digit matches the sum.
+		expect(redactMemorySecrets("id 10000000157")).toBe("id 10000000157");
+		// The tenth digit is correct but the final checksum is wrong.
+		expect(redactMemorySecrets("id 10000000145")).toBe("id 10000000145");
+	});
+
+	it("redacts an exact national IBAN span without consuming following prose", () => {
+		expect(redactMemorySecrets("pay TR330006100519786457841326 and continue")).toBe("pay [REDACTED:iban] and continue");
+		expect(redactMemorySecrets("pay tr33 0006 1005 1978 6457 8413 26 and continue")).toBe("pay [REDACTED:iban] and continue");
+		expect(redactMemorySecrets("GB82-WEST-1234-5698-7654-32 tomorrow")).toBe("[REDACTED:iban] tomorrow");
+		expect(redactMemorySecrets("TR330006100519786457841326 and GB82WEST12345698765432 tomorrow")).toBe(
+			"[REDACTED:iban] and [REDACTED:iban] tomorrow",
+		);
+	});
+
+	it("does not mask IBAN prefixes with invalid length, checksum, country, or token boundaries", () => {
+		expect(redactMemorySecrets("TR3300061005197864578413260")).toBe("TR3300061005197864578413260");
+		expect(redactMemorySecrets("TR33000610051978645784132 and continue")).toBe("TR33000610051978645784132 and continue");
+		expect(redactMemorySecrets("TR340006100519786457841326 and continue")).toBe("TR340006100519786457841326 and continue");
+		expect(redactMemorySecrets("XX330006100519786457841326")).toBe("XX330006100519786457841326");
+		expect(redactMemorySecrets("account_TR330006100519786457841326")).toBe("account_TR330006100519786457841326");
+	});
+
 	it("redacts PII with typed masks and strict validators (no FP on bad checksums); covers TR phones, TCKN, IBAN, CC", () => {
 		// email
 		expect(redactMemorySecrets("reach user.name+tag@sub.example.co.uk or not")).toBe("reach [REDACTED:email] or not");

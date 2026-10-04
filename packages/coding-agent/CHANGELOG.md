@@ -33,6 +33,7 @@
 
 - Prevented Turkish and English greeting-, thanks-, and acknowledgement-only sessions from being retained as memory episodes, including during shutdown.
 - Redacted email addresses, Turkish phone numbers and identity numbers, IBANs, and payment card numbers with typed masks before memory writes. Added credential-prefix coverage and applied the same protection to separate extraction and embedding text.
+- Fixed memory redaction missing nonuniform valid Turkish identity numbers and IBANs followed by ordinary prose, while preserving surrounding text and rejecting invalid checksums or account-number prefixes.
 
 ## [18.6.0] - 2026-10-03
 

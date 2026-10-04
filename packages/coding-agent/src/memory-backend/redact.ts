@@ -186,15 +186,17 @@ function redactPhones(input: string): string {
 
 function isValidTckn(str: string): boolean {
 	if (!/^[1-9]\d{10}$/.test(str)) return false;
-	const d = str.split("").map((n) => parseInt(n, 10));
-	// 10. and 11. hane separate controls
-	let sum = 0;
-	for (let i = 0; i < 10; i++) sum += d[i];
-	if (sum % 10 !== d[10]) return false;
-	const tek = d[0] + d[2] + d[4] + d[6] + d[8];
-	const cift = d[1] + d[3] + d[5] + d[7] + d[9];
-	if (((tek * 7 - cift) % 10 + 10) % 10 !== d[10]) return false;
-	return true;
+	let odd = 0;
+	let even = 0;
+	for (let index = 0; index < 9; index++) {
+		const digit = str.charCodeAt(index) - 48;
+		if (index % 2 === 0) odd += digit;
+		else even += digit;
+	}
+	const tenth = str.charCodeAt(9) - 48;
+	const eleventh = str.charCodeAt(10) - 48;
+	if (((7 * odd - even) % 10 + 10) % 10 !== tenth) return false;
+	return (odd + even + tenth) % 10 === eleventh;
 }
 
 function redactTckn(input: string): string {
@@ -202,9 +204,126 @@ function redactTckn(input: string): string {
 	return input.replace(re, (m) => (isValidTckn(m) ? "[REDACTED:tckn]" : m));
 }
 
+// National IBAN lengths bound candidates before trailing prose.
+// Format reference (including national/partial formats): https://www.iban.com/structure
+const IBAN_LENGTHS: Readonly<Record<string, number>> = {
+	AD: 24,
+	AE: 23,
+	AL: 28,
+	AO: 25,
+	AT: 20,
+	AZ: 28,
+	BA: 20,
+	BE: 16,
+	BF: 28,
+	BG: 22,
+	BH: 22,
+	BI: 27,
+	BJ: 28,
+	BR: 29,
+	BY: 28,
+	CF: 27,
+	CG: 27,
+	CH: 21,
+	CI: 28,
+	CM: 27,
+	CR: 22,
+	CV: 25,
+	CY: 28,
+	CZ: 24,
+	DE: 22,
+	DJ: 27,
+	DK: 18,
+	DO: 28,
+	DZ: 24,
+	EE: 20,
+	EG: 29,
+	ES: 24,
+	FI: 18,
+	FK: 18,
+	FO: 18,
+	FR: 27,
+	GA: 27,
+	GB: 22,
+	GE: 22,
+	GI: 23,
+	GL: 18,
+	GQ: 27,
+	GR: 27,
+	GT: 28,
+	GW: 25,
+	HN: 28,
+	HR: 21,
+	HU: 28,
+	IE: 22,
+	IL: 23,
+	IQ: 23,
+	IR: 26,
+	IS: 26,
+	IT: 27,
+	JO: 30,
+	KM: 27,
+	KW: 30,
+	KZ: 20,
+	LB: 28,
+	LC: 32,
+	LI: 21,
+	LT: 20,
+	LU: 20,
+	LV: 21,
+	LY: 25,
+	MA: 28,
+	MC: 27,
+	MD: 24,
+	ME: 22,
+	MG: 27,
+	MK: 19,
+	ML: 28,
+	MN: 20,
+	MR: 27,
+	MT: 31,
+	MU: 30,
+	MZ: 25,
+	NE: 28,
+	NI: 28,
+	NL: 18,
+	NO: 15,
+	OM: 23,
+	PK: 24,
+	PL: 28,
+	PS: 29,
+	PT: 25,
+	QA: 29,
+	RO: 24,
+	RS: 22,
+	RU: 33,
+	SA: 24,
+	SC: 31,
+	SD: 18,
+	SE: 24,
+	SI: 19,
+	SK: 24,
+	SM: 27,
+	SN: 28,
+	SO: 23,
+	ST: 25,
+	SV: 28,
+	TD: 27,
+	TG: 28,
+	TL: 23,
+	TN: 24,
+	TR: 26,
+	UA: 29,
+	VA: 22,
+	VG: 24,
+	XK: 20,
+	YE: 30,
+};
+
 function isValidIban(ibanRaw: string): boolean {
 	let iban = ibanRaw.replace(/[\s-]/g, "").toUpperCase();
 	if (!/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/.test(iban)) return false;
+	if (iban.length !== IBAN_LENGTHS[iban.slice(0, 2)]) return false;
 	iban = iban.slice(4) + iban.slice(0, 4);
 	let numStr = "";
 	for (let i = 0; i < iban.length; i++) {
@@ -220,8 +339,29 @@ function isValidIban(ibanRaw: string): boolean {
 }
 
 function redactIbans(input: string): string {
-	const re = /\b[A-Z]{2}\d{2}[A-Z0-9\s-]{11,30}\b/gi;
-	return input.replace(re, (m) => (isValidIban(m) ? "[REDACTED:iban]" : m));
+	const headers = /(?<![\p{L}\p{N}_])([A-Z]{2})\d{2}/giu;
+	const separator = /[\s-]/u;
+	const tokenCharacter = /[\p{L}\p{N}_]/u;
+	let out = "";
+	let copied = 0;
+	for (const match of input.matchAll(headers)) {
+		if (match.index < copied) continue;
+		const length = IBAN_LENGTHS[match[1].toUpperCase()];
+		if (length === undefined) continue;
+		let end = match.index + 4;
+		let characters = 4;
+		while (characters < length && end < input.length) {
+			const code = input.charCodeAt(end);
+			if ((code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)) characters++;
+			else if (!separator.test(input[end])) break;
+			end++;
+		}
+		if (characters !== length || tokenCharacter.test(input[end] ?? "")) continue;
+		if (!isValidIban(input.slice(match.index, end))) continue;
+		out += `${input.slice(copied, match.index)}[REDACTED:iban]`;
+		copied = end;
+	}
+	return copied === 0 ? input : out + input.slice(copied);
 }
 
 function isLuhnCard(value: string): boolean {
