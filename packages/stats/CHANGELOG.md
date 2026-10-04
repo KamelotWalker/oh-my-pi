@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added a Live quota panel to the Providers page showing each provider account's current limits, usage, status and reset countdown when the dashboard is opened from an omp session (`/stats`)
+- Added a Live quota panel to the Providers page showing each provider account's current limits, usage, status and reset countdown when the dashboard is opened from an omp session (`/stats`) ([#14313](https://github.com/can1357/oh-my-pi/pull/14313) by [@KamelotWalker](https://github.com/KamelotWalker))
 
 ## [18.6.0] - 2026-10-03
 

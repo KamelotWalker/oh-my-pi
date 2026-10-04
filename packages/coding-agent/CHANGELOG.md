@@ -4,7 +4,7 @@
 
 ### Added
 
-- `/stats` now shows this session's live provider quota (the same data as `/usage`) on the dashboard's Providers page, refreshed every minute from the cached usage path
+- `/stats` now shows this session's live provider quota (the same data as `/usage`) on the dashboard's Providers page, refreshed every minute from the cached usage path ([#14313](https://github.com/can1357/oh-my-pi/pull/14313) by [@KamelotWalker](https://github.com/KamelotWalker))
 
 ### Fixed
 
