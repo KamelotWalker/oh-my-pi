@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Incoming facts now strengthen a matching observation instead of storing a second copy. Evidence is the number of distinct sources, and a claim is aged with `superseded_by` only for an explicit negation or a known single-valued relation; otherwise both records stay active. Each reinforcement or weakening is written to `memory_validations` with the source id and a short quote. Recall hides aged facts and gives extra evidence a small score boost. Fact consolidation of knowledge-graph triples runs on every write, not only when polyphonic recall is on.
+- Added `world`/`experience` semantic kinds to extracted facts, persisted independently of MEMORIA categories and exposed in recall. Existing databases migrate automatically with historical facts treated as world knowledge.
+
+### Fixed
+
+- Stopped chatter and arbitrary prose from becoming facts through extraction fallback, including framed conversation input. Preserved Turkish declarative legacy output and completed items in truncated structured JSON without retaining unfinished items or schema text.
+
+
 ## [18.5.1] - 2026-10-03
 
 ### Changed

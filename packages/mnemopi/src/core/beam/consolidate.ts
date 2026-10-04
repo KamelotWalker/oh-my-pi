@@ -1,14 +1,33 @@
 import type { SQLQueryBindings } from "bun:sqlite";
 import { logger } from "@oh-my-pi/pi-utils";
-import { polyphonicRecallEnabled } from "../../config";
 import { generateId, stableMemoryId } from "../../util/ids";
 import { aaakEncode } from "../aaak";
 import { REGEX_EXTRACTION_MAX_INPUT_CHARS } from "../entities";
 import { EpisodicGraph } from "../episodic-graph";
 import { type ExtractedFactCategories, heuristicExtractFacts } from "../extraction";
-import { clampVeracity, VERACITY_WEIGHTS, type Veracity, VeracityConsolidator } from "../veracity-consolidation";
+import { hasRetainableContent } from "../content-noise";
+import {
+	classifyObservation,
+	clampVeracity,
+	computeFactId,
+	mergeEvidenceSources,
+	normalizeObservationText,
+	recordMemoryValidation,
+	SINGLE_VALUED_PREDICATES,
+	VERACITY_WEIGHTS,
+	type Veracity,
+	VeracityConsolidator,
+} from "../veracity-consolidation";
 import { scheduleEmbedding } from "./helpers";
-import type { BeamMemoryState, BeamStats, JsonValue, MemoriaRetrieveResult, Metadata, SleepResult } from "./types";
+import type {
+	BeamMemoryState,
+	BeamStats,
+	JsonValue,
+	MemoryFactKind,
+	MemoriaRetrieveResult,
+	Metadata,
+	SleepResult,
+} from "./types";
 
 type Row = Record<string, unknown>;
 
@@ -264,6 +283,161 @@ function emitEvent(
 	void beam.pluginManager?.emit?.(event);
 }
 
+interface ObservationFactRow {
+	readonly fact_id: string;
+	readonly subject: string;
+	readonly predicate: string;
+	readonly object: string;
+	readonly confidence: number;
+	readonly sources_json: string | null;
+	readonly superseded_by: string | null;
+	readonly source_msg_id: string | null;
+}
+
+interface ObservationPreferenceRow {
+	readonly id: number;
+	readonly preference: string | null;
+	readonly sources_json: string | null;
+	readonly superseded_by: string | null;
+	readonly source_memory_id: string | null;
+}
+
+interface EvidenceSource {
+	readonly sourceId: string;
+	readonly fromSummary: boolean;
+	readonly scope: string;
+}
+
+function memoryScope(beam: BeamMemoryState, memoryId: string): string | null {
+	const working = beam.db.query("SELECT scope FROM working_memory WHERE id = ?").get(memoryId) as {
+		scope: string | null;
+	} | null;
+	if (working !== null) return working.scope;
+	const episodic = beam.db.query("SELECT scope FROM episodic_memory WHERE id = ?").get(memoryId) as {
+		scope: string | null;
+	} | null;
+	return episodic?.scope ?? null;
+}
+
+function evidenceSource(beam: BeamMemoryState, sourceMemoryId: string | null): EvidenceSource {
+	const raw = sourceMemoryId?.trim() ?? "";
+	if (raw === "") return { sourceId: `session:${sourceSession(beam)}`, fromSummary: false, scope: "session" };
+	const episodic = beam.db.query("SELECT summary_of, scope FROM episodic_memory WHERE id = ?").get(raw) as {
+		summary_of: string | null;
+		scope: string | null;
+	} | null;
+	if (episodic?.summary_of) {
+		const first = episodic.summary_of
+			.split(",")
+			.map(part => part.trim())
+			.find(part => part !== "");
+		if (first !== undefined) {
+			const scope = memoryScope(beam, first) ?? episodic.scope ?? "session";
+			return { sourceId: first, fromSummary: true, scope: scope === "" ? "session" : scope };
+		}
+		const summaryScope = episodic.scope ?? "session";
+		return { sourceId: raw, fromSummary: true, scope: summaryScope === "" ? "session" : summaryScope };
+	}
+	const scope = memoryScope(beam, raw) ?? "session";
+	return { sourceId: raw, fromSummary: false, scope: scope === "" ? "session" : scope };
+}
+
+function seededSources(raw: string | null, legacySource: string | null): string | null {
+	if (raw !== null && raw !== "") return raw;
+	const legacy = legacySource?.trim() ?? "";
+	return legacy === "" ? null : JSON.stringify([legacy]);
+}
+
+function canonicalFactId(memoryKind: MemoryFactKind, factType: string, key: string, value: string): string {
+	return stableMemoryId(`${memoryKind}\0${factType}\0${key}\0${normalizeObservationText(value)}`, "");
+}
+
+function findCanonicalFact(
+	beam: BeamMemoryState,
+	memoryKind: MemoryFactKind,
+	factType: string,
+	key: string,
+	value: string,
+	factId: string,
+): ObservationFactRow | null {
+	return (
+		(beam.db
+			.query(
+				`SELECT fact_id, subject, predicate, object, confidence, sources_json, superseded_by, source_msg_id
+				 FROM facts
+				 WHERE memory_kind = ? AND predicate = ? AND subject = ? AND (fact_id = ? OR object = ?)
+				 ORDER BY CASE WHEN fact_id = ? THEN 0 ELSE 1 END,
+				          CASE WHEN superseded_by IS NULL THEN 0 ELSE 1 END
+				 LIMIT 1`,
+			)
+			.get(memoryKind, factType, key, factId, value, factId) as ObservationFactRow | null) ?? null
+	);
+}
+
+function strengthenCanonicalFact(
+	beam: BeamMemoryState,
+	row: ObservationFactRow,
+	sourceId: string,
+	quote: string,
+	revive: boolean,
+): boolean {
+	const merged = mergeEvidenceSources(seededSources(row.sources_json, row.source_msg_id), sourceId);
+	if (!merged.added && !revive) return false;
+	const confidence = Math.min(1, row.confidence + (1 - row.confidence) * 0.15);
+	beam.db.run(
+		`UPDATE facts
+		 SET proof_count = ?, sources_json = ?, confidence = ?, timestamp = ?,
+		     superseded_by = CASE WHEN ? = 1 THEN NULL ELSE superseded_by END
+		 WHERE fact_id = ?`,
+		[merged.sources.length, JSON.stringify(merged.sources), confidence, isoNow(), revive ? 1 : 0, row.fact_id],
+	);
+	if (!merged.added) return true;
+	recordMemoryValidation(beam.db, { memoryId: row.fact_id, sourceId, action: "reinforce", quote });
+	return true;
+}
+
+function ageFact(
+	beam: BeamMemoryState,
+	old: ObservationFactRow,
+	winnerId: string,
+	sourceId: string,
+	quote: string,
+	newContent: string,
+): void {
+	beam.db.run(`UPDATE facts SET superseded_by = ?, confidence = ? WHERE fact_id = ? AND superseded_by IS NULL`, [
+		winnerId,
+		Math.max(0.05, old.confidence * 0.5),
+		old.fact_id,
+	]);
+	recordMemoryValidation(beam.db, {
+		memoryId: old.fact_id,
+		sourceId,
+		action: "weaken",
+		quote,
+		newContent,
+	});
+}
+
+function explicitContradictions(
+	beam: BeamMemoryState,
+	factType: string,
+	key: string,
+	memoryKind: MemoryFactKind,
+	exceptId: string,
+	value: string,
+): ObservationFactRow[] {
+	const rows = beam.db
+		.query(
+			`SELECT fact_id, subject, predicate, object, confidence, sources_json, superseded_by, source_msg_id
+			 FROM facts
+			 WHERE predicate = ? AND subject = ? AND memory_kind = ? AND superseded_by IS NULL AND fact_id != ?
+			 ORDER BY rowid DESC
+			 LIMIT 40`,
+		)
+		.all(factType, key, memoryKind, exceptId) as ObservationFactRow[];
+	return rows.filter(row => classifyObservation(value, row.object) === "contradicts");
+}
+
 function insertFactRows(
 	beam: BeamMemoryState,
 	messageIdx: number,
@@ -273,22 +447,71 @@ function insertFactRows(
 	context: string,
 	importance: number,
 	sourceMemoryId: string | null,
+	memoryKind: MemoryFactKind = "world",
 ): void {
 	const timestamp = isoNow();
+	const sessionId = sourceSession(beam);
 	beam.db.run(
 		`INSERT INTO memoria_facts
-		 (session_id, message_idx, fact_type, key, value, context_snippet, importance, timestamp, source_memory_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		[sourceSession(beam), messageIdx, factType, key, value, context, importance, timestamp, sourceMemoryId],
+		 (session_id, message_idx, fact_type, memory_kind, key, value, context_snippet, importance, timestamp, source_memory_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		[sessionId, messageIdx, factType, memoryKind, key, value, context, importance, timestamp, sourceMemoryId],
 	);
 
-	const factId = stableMemoryId(`${sourceSession(beam)}\0${factType}\0${key}\0${value}`, sourceMemoryId ?? "");
-	beam.db.run(
+	const evidence = evidenceSource(beam, sourceMemoryId);
+	const quote = context.trim() === "" ? value : context;
+	const canonicalId = canonicalFactId(memoryKind, factType, key, value);
+	const same = findCanonicalFact(beam, memoryKind, factType, key, value, canonicalId);
+	if (same !== null) {
+		if (evidence.fromSummary && same.superseded_by !== null) return;
+		strengthenCanonicalFact(
+			beam,
+			same,
+			evidence.sourceId,
+			quote,
+			same.superseded_by !== null && !evidence.fromSummary,
+		);
+		if (same.superseded_by !== null && !evidence.fromSummary) {
+			for (const old of explicitContradictions(beam, factType, key, memoryKind, same.fact_id, value)) {
+				ageFact(beam, old, same.fact_id, evidence.sourceId, quote, value);
+			}
+		}
+		return;
+	}
+
+	const inserted = beam.db.run(
 		`INSERT OR IGNORE INTO facts
-		 (fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		[factId, sourceSession(beam), key, factType, value, timestamp, sourceMemoryId, importance],
+		 (fact_id, session_id, subject, predicate, object, timestamp, source_msg_id, confidence, memory_kind, scope, proof_count, sources_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+		[
+			canonicalId,
+			sessionId,
+			key,
+			factType,
+			value,
+			timestamp,
+			sourceMemoryId,
+			importance,
+			memoryKind,
+			evidence.scope,
+			JSON.stringify([evidence.sourceId]),
+		],
 	);
+	if (inserted.changes === 0) {
+		const raced = findCanonicalFact(beam, memoryKind, factType, key, value, canonicalId);
+		if (raced === null || (evidence.fromSummary && raced.superseded_by !== null)) return;
+		strengthenCanonicalFact(
+			beam,
+			raced,
+			evidence.sourceId,
+			quote,
+			raced.superseded_by !== null && !evidence.fromSummary,
+		);
+		return;
+	}
+	for (const old of explicitContradictions(beam, factType, key, memoryKind, canonicalId, value)) {
+		ageFact(beam, old, canonicalId, evidence.sourceId, quote, value);
+	}
 }
 
 function insertTimeline(
@@ -342,8 +565,8 @@ function sourceMemoryVeracity(beam: BeamMemoryState, sourceMemoryId: string | nu
 }
 
 /**
- * This beam's veracity consolidator, created on first use so `consolidated_facts` /
- * `conflicts` DDL only runs once polyphonic recall needs them.
+ * This beam's veracity consolidator, created on first fact write. `consolidated_facts`
+ * is the cross-session observation store, not a polyphonic-only side table.
  */
 export function ensureVeracityConsolidator(beam: BeamMemoryState): VeracityConsolidator {
 	const existing = beam.veracityConsolidator;
@@ -355,10 +578,10 @@ export function ensureVeracityConsolidator(beam: BeamMemoryState): VeracityConso
 
 /**
  * Feed an extracted subject/predicate/object fact into the veracity consolidator so
- * repeated mentions gain confidence in `consolidated_facts`, which the polyphonic
- * recall fact voice reads. Only runs while polyphonic recall is enabled for this beam;
- * facts written with it off are picked up by {@link backfillConsolidatedFacts}.
- * Best-effort: a failure never blocks the extraction write.
+ * repeated mentions gain confidence in `consolidated_facts`. Runs on every KG write,
+ * including while polyphonic recall is off. A matching claim from a new source
+ * strengthens; a single-valued contradiction is aged with `superseded_by` instead of
+ * being left as a second current fact. Best-effort: a failure never blocks the write.
  */
 function consolidateKgFact(
 	beam: BeamMemoryState,
@@ -367,31 +590,76 @@ function consolidateKgFact(
 	object: string,
 	sourceMemoryId: string | null,
 ): void {
-	if (!polyphonicRecallEnabled(process.env, beam.config?.polyphonicRecall)) return;
 	const cleanSubject = subject.trim();
 	const cleanPredicate = predicate.trim();
 	const cleanObject = object.trim();
 	if (cleanSubject === "" || cleanPredicate === "" || cleanObject === "") return;
+	const evidence = evidenceSource(beam, sourceMemoryId);
+	const sourceId = evidence.sourceId;
+	const quote = `${cleanSubject} ${cleanPredicate} ${cleanObject}`;
 	try {
-		ensureVeracityConsolidator(beam).consolidateFact(
+		const consolidator = ensureVeracityConsolidator(beam);
+		if (evidence.fromSummary) {
+			const existing = consolidator.conn
+				.query(
+					"SELECT superseded_by, sources_json FROM consolidated_facts WHERE subject = ? AND predicate = ? AND object = ?",
+				)
+				.get(cleanSubject, cleanPredicate, cleanObject) as {
+				superseded_by: string | null;
+				sources_json: string | null;
+			} | null;
+			if (existing !== null && existing.superseded_by !== null) return;
+			if (existing !== null && !mergeEvidenceSources(existing.sources_json, sourceId).added) return;
+		}
+		const prior = consolidator.conn
+			.query("SELECT sources_json FROM consolidated_facts WHERE subject = ? AND predicate = ? AND object = ?")
+			.get(cleanSubject, cleanPredicate, cleanObject) as { sources_json: string | null } | null;
+		const priorCount = mergeEvidenceSources(prior?.sources_json ?? null, "").sources.length;
+		const consolidated = consolidator.consolidateFact(
 			cleanSubject,
 			cleanPredicate,
 			cleanObject,
 			sourceMemoryVeracity(beam, sourceMemoryId),
-			sourceMemoryId,
+			sourceId,
 		);
+		if (priorCount > 0 && consolidated.sources.length > priorCount && consolidated.id !== null) {
+			recordMemoryValidation(beam.db, {
+				memoryId: consolidated.id,
+				sourceId,
+				action: "reinforce",
+				quote,
+			});
+		}
+		if (!Object.hasOwn(SINGLE_VALUED_PREDICATES, cleanPredicate.toLowerCase())) return;
+		const winnerId = computeFactId(cleanSubject, cleanPredicate, cleanObject);
+		const losers = beam.db
+			.query(
+				`SELECT id FROM consolidated_facts
+				 WHERE subject = ? AND predicate = ? AND object != ? AND superseded_by IS NULL`,
+			)
+			.all(cleanSubject, cleanPredicate, cleanObject) as { id: string }[];
+		for (const loser of losers) {
+			if (loser.id === winnerId) continue;
+			ensureVeracityConsolidator(beam).resolveConflictByFacts(winnerId, loser.id);
+			recordMemoryValidation(beam.db, {
+				memoryId: loser.id,
+				sourceId,
+				action: "weaken",
+				quote,
+				newContent: cleanObject,
+			});
+		}
 	} catch (error) {
-		// Fact consolidation is an enrichment; the MEMORIA/KG rows above are already written,
-		// and the next polyphonic engine built on this bank backfills the fact.
 		logger.warn("mnemopi: fact consolidation failed", { subject: cleanSubject, error: String(error) });
 	}
 }
 
 /**
- * Consolidate every extracted KG fact (`memoria_kg`) whose source memory is not yet
- * among that fact's `consolidated_facts` sources, e.g. facts written while polyphonic
- * recall was off. Idempotent: a (fact, source) pair is only ever counted once.
- * Facts without a source memory are skipped; the fact voice could not return them.
+ * Consolidate extracted KG facts (`memoria_kg`) whose source is not yet among that
+ * fact's `consolidated_facts` sources. New writes consolidate immediately; this
+ * catches legacy banks and writes whose consolidation failed. Idempotent: a
+ * (fact, source) pair is only ever counted once. Facts without a source memory
+ * are skipped; the fact voice could not return them.
  */
 export function backfillConsolidatedFacts(beam: BeamMemoryState, consolidator: VeracityConsolidator): number {
 	const rows = beam.db
@@ -432,11 +700,62 @@ function insertPreference(
 	topic: string | null,
 	sourceMemoryId: string | null,
 ): void {
-	beam.db.run(
-		`INSERT INTO memoria_preferences (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		[sourceSession(beam), messageIdx, preference, topic, null, preference, sourceMemoryId],
+	const evidence = evidenceSource(beam, sourceMemoryId);
+	const same = beam.db
+		.query(
+			`SELECT id, preference, sources_json, superseded_by, source_memory_id
+			 FROM memoria_preferences
+			 WHERE preference = ?
+			 ORDER BY CASE WHEN superseded_by IS NULL THEN 0 ELSE 1 END, id DESC
+			 LIMIT 1`,
+		)
+		.get(preference) as ObservationPreferenceRow | null;
+	if (same !== null) {
+		if (evidence.fromSummary && same.superseded_by !== null) return;
+		const merged = mergeEvidenceSources(seededSources(same.sources_json, same.source_memory_id), evidence.sourceId);
+		const revive = same.superseded_by !== null && !evidence.fromSummary;
+		if (!merged.added && !revive) return;
+		beam.db.run(
+			`UPDATE memoria_preferences
+			 SET proof_count = ?, sources_json = ?, evolution = 'reinforced',
+			     superseded_by = CASE WHEN ? = 1 THEN NULL ELSE superseded_by END
+			 WHERE id = ?`,
+			[merged.sources.length, JSON.stringify(merged.sources), revive ? 1 : 0, same.id],
+		);
+		return;
+	}
+
+	const inserted = beam.db.run(
+		`INSERT INTO memoria_preferences
+		 (session_id, message_idx, preference, topic, evolution, context_snippet, source_memory_id, proof_count, sources_json)
+		 VALUES (?, ?, ?, ?, NULL, ?, ?, 1, ?)`,
+		[
+			sourceSession(beam),
+			messageIdx,
+			preference,
+			topic,
+			preference,
+			sourceMemoryId,
+			JSON.stringify([evidence.sourceId]),
+		],
 	);
+	const newId = String(inserted.lastInsertRowid);
+	const active = beam.db
+		.query(
+			`SELECT id, preference, sources_json, superseded_by, source_memory_id
+			 FROM memoria_preferences
+			 WHERE superseded_by IS NULL AND id != ?
+			 ORDER BY id DESC
+			 LIMIT 40`,
+		)
+		.all(Number(newId)) as ObservationPreferenceRow[];
+	for (const row of active) {
+		if (classifyObservation(preference, row.preference ?? "") !== "contradicts") continue;
+		beam.db.run(
+			"UPDATE memoria_preferences SET superseded_by = ?, evolution = 'superseded' WHERE id = ? AND superseded_by IS NULL",
+			[newId, row.id],
+		);
+	}
 }
 
 function insertInstruction(
@@ -590,6 +909,7 @@ export function detectLanguage(_beam: BeamMemoryState, text: string): string {
 }
 type StoreFactStringOptions = {
 	routeHeuristicCategories?: boolean;
+	factKinds?: Readonly<Record<string, MemoryFactKind>>;
 };
 
 export function storeFactStrings(
@@ -603,7 +923,9 @@ export function storeFactStrings(
 	const routeHeuristicCategories = options.routeHeuristicCategories ?? true;
 	let stored = 0;
 	for (const fact of facts) {
-		insertFactRows(beam, messageIdx, "entity", "fact", fact, fact, importance, sourceMemoryId);
+		if (!hasRetainableContent(fact)) continue;
+		const memoryKind = options.factKinds?.[fact] === "experience" ? "experience" : "world";
+		insertFactRows(beam, messageIdx, "entity", "fact", fact, fact, importance, sourceMemoryId, memoryKind);
 		stored++;
 		if (!routeHeuristicCategories) continue;
 		const pref = /^The user (prefers|dislikes) (.+)$/i.exec(fact);
@@ -626,15 +948,20 @@ export function storeExtractedFactCategories(
 	sourceMemoryId: string | null = null,
 	importance = 0.7,
 ): number {
-	let stored = storeFactStrings(beam, extracted.facts, messageIdx, sourceMemoryId, importance);
+	let stored = storeFactStrings(beam, extracted.facts, messageIdx, sourceMemoryId, importance, {
+		factKinds: extracted.factKinds,
+	});
 	stored += storeFactStrings(beam, extracted.instructions, messageIdx, sourceMemoryId, importance, {
 		routeHeuristicCategories: false,
+		factKinds: extracted.factKinds,
 	});
 	stored += storeFactStrings(beam, extracted.preferences, messageIdx, sourceMemoryId, importance, {
 		routeHeuristicCategories: false,
+		factKinds: extracted.factKinds,
 	});
 	stored += storeFactStrings(beam, extracted.timelines, messageIdx, sourceMemoryId, importance, {
 		routeHeuristicCategories: false,
+		factKinds: extracted.factKinds,
 	});
 	for (const instruction of extracted.instructions) {
 		insertInstruction(beam, messageIdx, instruction, instruction, sourceMemoryId);

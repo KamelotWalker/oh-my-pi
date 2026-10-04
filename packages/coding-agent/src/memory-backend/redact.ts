@@ -9,6 +9,16 @@
 // Fixed-prefix provider tokens. Each is anchored on a literal, so it matches in one
 // pass with no backtracking.
 const PATTERNS = [
+	// More specific first (per Hindsight pattern ordering for no partial consume).
+	/sk-ant-[A-Za-z0-9_-]{20,}/g,
+	/sk-proj-[A-Za-z0-9_-]{48,}/g,
+	/sk-admin-[A-Za-z0-9_-]{40,}/g,
+	/gsk_[A-Za-z0-9]{20,}/g,
+	/hf_[A-Za-z0-9]{30,}/g,
+	/xai-[A-Za-z0-9]{40,}/g,
+	/pplx-[A-Za-z0-9]{40,}/g,
+	/ya29\.[0-9A-Za-z_-]{20,}/g,
+	/dapi[A-Za-z0-9]{32}/g,
 	/(?:AKIA|ASIA)[A-Z0-9]{16}/g,
 	// Common provider token prefixes (GitHub, npm, Slack, Google).
 	/(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g,
@@ -17,7 +27,6 @@ const PATTERNS = [
 	/xox[baprs]-[A-Za-z0-9-]{10,}/g,
 	/AIza[A-Za-z0-9_-]{30,}/g,
 ];
-
 // Longest first, so `token_` wins over `tok` and reports the full match start.
 const KEYWORDS = ["password", "secret", "token", "key", "tok", "sk", "pk", "rk"];
 // A segment mixing letters and digits is credential-like at 12 characters. Letters
@@ -26,15 +35,16 @@ const KEYWORDS = ["password", "secret", "token", "key", "tok", "sk", "pk", "rk"]
 const MIN_MIXED_SEGMENT = 12;
 const MIN_LETTERS_SEGMENT = 16;
 
-const isDelimiter = (code: number) => code === 45 || code === 95;
+// (isDelimiter inlined per ts-no-tiny-functions rule; no one-line rename wrapper)
+const isTokenChar = (code: number) =>
+	(code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || (code === 45 || code === 95);
 
 function isCredentialSegment(length: number, letter: boolean, digit: boolean): boolean {
 	if (!letter && !digit) return false;
 	if (letter && digit) return length >= MIN_MIXED_SEGMENT;
 	return length >= MIN_LETTERS_SEGMENT;
 }
-const isTokenChar = (code: number) =>
-	(code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || isDelimiter(code);
+
 
 function keywordStart(input: string, delimiter: number): number {
 	for (const keyword of KEYWORDS) {
@@ -73,7 +83,7 @@ function redactKeywordSecrets(input: string): string {
 		let digit = false;
 		while (index < input.length && isTokenChar(input.charCodeAt(index))) {
 			const current = input.charCodeAt(index);
-			if (isDelimiter(current)) {
+			if (current === 45 || current === 95) {
 				credential.push(isCredentialSegment(length, letter, digit));
 				starts.push(index + 1);
 				length = 0;
@@ -142,9 +152,111 @@ function redactJwts(input: string): string {
 	return copied === 0 ? input : out + input.slice(copied);
 }
 
+// --- PII redaction (high-precision, low FP; ported ideas+validators from Hindsight) ---
+// Credential (keyword/PATTERNS/JWT) FIRST to preserve full matches and avoid partial leaks.
+// Then PII for standalone with typed [REDACTED:xxx].
+
+function redactEmails(input: string): string {
+	// Linear scan (indexOf + bounds) to avoid ReDoS/quadratic on bad inputs like long @-less or . runs.
+	let out = "";
+	let copied = 0;
+	let pos = 0;
+	while ((pos = input.indexOf("@", pos)) !== -1) {
+		let start = pos;
+		while (start > copied && /[A-Za-z0-9._%+-]/.test(input[start - 1])) start--;
+		let end = pos + 1;
+		while (end < input.length && /[A-Za-z0-9.-]/.test(input[end])) end++;
+		const dom = input.slice(pos + 1, end);
+		if (dom.includes(".") && /[A-Za-z]{2,}$/.test(dom)) {
+			out += input.slice(copied, start) + "[REDACTED:email]";
+			copied = end;
+			pos = end;
+			continue;
+		}
+		pos++;
+	}
+	return copied === 0 ? input : out + input.slice(copied);
+}
+
+function redactPhones(input: string): string {
+	// TR +90/05xx; leading token bound to avoid matching inside code tokens, ports, line nums.
+	const re = /(?<![A-Za-z0-9_])(?:\+90|0)[\s-]?5[0-9]{2}[\s-]?[0-9]{3}[\s-]?[0-9]{2}[\s-]?[0-9]{2}(?![0-9])/g;
+	return input.replace(re, "[REDACTED:phone]");
+}
+
+function isValidTckn(str: string): boolean {
+	if (!/^[1-9]\d{10}$/.test(str)) return false;
+	const d = str.split("").map((n) => parseInt(n, 10));
+	// 10. and 11. hane separate controls
+	let sum = 0;
+	for (let i = 0; i < 10; i++) sum += d[i];
+	if (sum % 10 !== d[10]) return false;
+	const tek = d[0] + d[2] + d[4] + d[6] + d[8];
+	const cift = d[1] + d[3] + d[5] + d[7] + d[9];
+	if (((tek * 7 - cift) % 10 + 10) % 10 !== d[10]) return false;
+	return true;
+}
+
+function redactTckn(input: string): string {
+	const re = /(?<![A-Za-z0-9_])\d{11}(?![A-Za-z0-9_])/g;
+	return input.replace(re, (m) => (isValidTckn(m) ? "[REDACTED:tckn]" : m));
+}
+
+function isValidIban(ibanRaw: string): boolean {
+	let iban = ibanRaw.replace(/[\s-]/g, "").toUpperCase();
+	if (!/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/.test(iban)) return false;
+	iban = iban.slice(4) + iban.slice(0, 4);
+	let numStr = "";
+	for (let i = 0; i < iban.length; i++) {
+		const c = iban.charCodeAt(i);
+		if (c >= 65 && c <= 90) numStr += (c - 55).toString();
+		else numStr += iban[i];
+	}
+	let rem = 0;
+	for (let i = 0; i < numStr.length; i++) {
+		rem = (rem * 10 + parseInt(numStr[i], 10)) % 97;
+	}
+	return rem === 1;
+}
+
+function redactIbans(input: string): string {
+	const re = /\b[A-Z]{2}\d{2}[A-Z0-9\s-]{11,30}\b/gi;
+	return input.replace(re, (m) => (isValidIban(m) ? "[REDACTED:iban]" : m));
+}
+
+function isLuhnCard(value: string): boolean {
+	const digitsStr = value.replace(/[\s-]/g, "");
+	if (!/^\d{13,19}$/.test(digitsStr)) return false;
+	const digits = digitsStr.split("").map((n) => parseInt(n, 10));
+	if (new Set(digits).size === 1) return false;
+	let sum = 0;
+	let alt = false;
+	for (let i = digits.length - 1; i >= 0; i--) {
+		let d = digits[i];
+		if (alt) {
+			d *= 2;
+			if (d > 9) d -= 9;
+		}
+		sum += d;
+		alt = !alt;
+	}
+	return sum % 10 === 0;
+}
+
+function redactCreditCards(input: string): string {
+	// 13-19 total digits, any common grouping with seps
+	const re = /(?<![A-Za-z0-9_])(?<!\d)(?<!\d\.)(?:\d[ -]?){12,18}\d(?!\d)(?!\.\d)(?![A-Za-z0-9_])/g;
+	return input.replace(re, (m) => (isLuhnCard(m) ? "[REDACTED:credit_card]" : m));
+}
+
 export function redactMemorySecrets(input: string): string {
 	let out = redactJwts(redactKeywordSecrets(input));
 	for (const pattern of PATTERNS) out = out.replace(pattern, "[REDACTED]");
+	out = redactEmails(out);
+	out = redactPhones(out);
+	out = redactTckn(out);
+	out = redactIbans(out);
+	out = redactCreditCards(out);
 	return out;
 }
 
@@ -156,6 +268,7 @@ export function redactMemorySecrets(input: string): string {
 const TEXT_FIELDS = [
 	"content",
 	"extractText",
+	"experienceText",
 	"extract_text",
 	"embedText",
 	"embed_text",
