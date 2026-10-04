@@ -41,6 +41,49 @@ describe("extracted semantic fact kinds", () => {
 		}
 	});
 
+	it("preserves duplicate-text kinds through structured storage and experience-only filtering", async () => {
+		const fact = "The parser uses tabs";
+		for (const experienceOnly of [false, true]) {
+			const memory = new Mnemopi({
+				dbPath: ":memory:",
+				noEmbeddings: true,
+				llm: {
+					enabled: true,
+					complete: () => JSON.stringify({
+						facts: [
+							{ text: `${fact}.`, kind: "world" },
+							{ text: `${fact}!`, kind: "experience" },
+						],
+						timelines: experienceOnly ? [] : [{ text: fact, kind: "world" }],
+					}),
+				},
+			});
+			try {
+				memory.remember("The parser uses tabs.", {
+					extract: true,
+					extractText: experienceOnly ? "" : "The parser uses tabs.",
+					experienceText: experienceOnly ? "I updated the parser to use tabs." : undefined,
+				});
+				await memory.flushExtractions();
+				expect(memory.conn.query("SELECT memory_kind FROM facts ORDER BY memory_kind").all()).toEqual(
+					experienceOnly
+						? [{ memory_kind: "experience" }]
+						: [{ memory_kind: "experience" }, { memory_kind: "world" }],
+				);
+				expect(memory.conn.query("SELECT memory_kind FROM memoria_facts ORDER BY id").all()).toEqual(
+					experienceOnly
+						? [{ memory_kind: "experience" }]
+						: [{ memory_kind: "world" }, { memory_kind: "experience" }, { memory_kind: "world" }],
+				);
+				expect(memory.conn.query("SELECT COUNT(*) AS count FROM memoria_timelines").get()).toEqual({
+					count: experienceOnly ? 0 : 1,
+				});
+			} finally {
+				memory.close();
+			}
+		}
+	});
+
 	it("opens an old database without losing facts and migrates their kind only once", async () => {
 		const dir = TempDir.createSync("@mnemopi-fact-kind-migration-");
 		const dbPath = dir.join("old.db");
@@ -80,7 +123,7 @@ describe("extracted semantic fact kinds", () => {
 			expect(storeFactStrings(memory.beam, ["Selam Echo", "Thank you very much"])).toBe(0);
 			const fact = "The parser uses tabs";
 			storeFactStrings(memory.beam, [fact]);
-			storeFactStrings(memory.beam, [fact], 0, null, 0.7, { factKinds: { [fact]: "experience" } });
+			storeFactStrings(memory.beam, [{ text: fact, kind: "experience" }]);
 			expect(memory.conn.query("SELECT memory_kind FROM facts ORDER BY memory_kind").all()).toEqual([
 				{ memory_kind: "experience" }, { memory_kind: "world" },
 			]);

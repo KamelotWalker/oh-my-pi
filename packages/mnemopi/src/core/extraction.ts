@@ -81,15 +81,19 @@ export interface ExtractedKgTriple {
 	object: string;
 }
 
+/** Preserve each item's semantic provenance even when normalized texts coincide. */
+export interface ExtractedMemoryFact {
+	text: string;
+	kind: MemoryFactKind;
+}
+
 /** Category-preserving extraction result used by background memory routing. */
 export interface ExtractedFactCategories {
-	facts: string[];
-	instructions: string[];
-	preferences: string[];
-	timelines: string[];
+	facts: ExtractedMemoryFact[];
+	instructions: ExtractedMemoryFact[];
+	preferences: ExtractedMemoryFact[];
+	timelines: ExtractedMemoryFact[];
 	kg: ExtractedKgTriple[];
-	/** Semantic kind keyed by normalized item text; untyped legacy output is world knowledge. */
-	factKinds?: Record<string, MemoryFactKind>;
 }
 
 function emptyFactCategories(): ExtractedFactCategories {
@@ -105,14 +109,13 @@ function normalizeFact(fact: string): string {
 interface FactArrayOptions {
 	fields: readonly string[];
 	joinFields?: boolean;
-	factKinds?: Record<string, MemoryFactKind>;
 }
 
-function normalizeFactArray(items: unknown, options: FactArrayOptions): string[] {
+function normalizeFactArray(items: unknown, options: FactArrayOptions): ExtractedMemoryFact[] {
 	if (!Array.isArray(items)) {
 		return [];
 	}
-	const out: string[] = [];
+	const out: ExtractedMemoryFact[] = [];
 	for (const item of items) {
 		let text: string | null = null;
 		if (typeof item === "string") {
@@ -134,10 +137,7 @@ function normalizeFactArray(items: unknown, options: FactArrayOptions): string[]
 		if (text !== null && text !== "") {
 			const normalized = normalizeFact(text);
 			if (normalized !== "" && hasRetainableContent(normalized)) {
-				out.push(normalized);
-				if (options.factKinds && isRecord(item)) {
-					options.factKinds[normalized] = item.kind === "experience" ? "experience" : "world";
-				}
+				out.push({ text: normalized, kind: isRecord(item) && item.kind === "experience" ? "experience" : "world" });
 				if (out.length >= STRUCTURED_CATEGORY_LIMIT) break;
 			}
 		}
@@ -184,18 +184,18 @@ function normalizeKgArray(items: unknown): ExtractedKgTriple[] {
 	return out;
 }
 
-/** Flatten extracted string categories for legacy fact callers. */
+/** Flatten typed categories for flat-text fact callers. */
 export function flattenExtractedFactCategories(extracted: ExtractedFactCategories): string[] {
 	const out: string[] = [];
 	for (const category of STRING_CATEGORY_KEYS) {
 		for (const item of extracted[category]) {
-			out.push(item);
+			out.push(item.text);
 		}
 	}
 	return out;
 }
 
-/** Count string facts plus KG triples in a category-preserving extraction result. */
+/** Count typed facts plus KG triples in a category-preserving extraction result. */
 export function countExtractedFactCategories(extracted: ExtractedFactCategories): number {
 	return (
 		extracted.facts.length +
@@ -259,18 +259,15 @@ export function parseExtractedFactCategories(rawOutput: string | null | undefine
 		try {
 			const parsed: unknown = JSON.parse(rawClean);
 			if (isRecord(parsed)) {
-				const factKinds: Record<string, MemoryFactKind> = {};
 				return {
-					facts: normalizeFactArray(parsed.facts, { fields: FACT_TEXT_FIELD_KEYS, factKinds }),
-					instructions: normalizeFactArray(parsed.instructions, { fields: INSTRUCTION_TEXT_FIELD_KEYS, factKinds }),
-					preferences: normalizeFactArray(parsed.preferences, { fields: PREFERENCE_TEXT_FIELD_KEYS, factKinds }),
+					facts: normalizeFactArray(parsed.facts, { fields: FACT_TEXT_FIELD_KEYS }),
+					instructions: normalizeFactArray(parsed.instructions, { fields: INSTRUCTION_TEXT_FIELD_KEYS }),
+					preferences: normalizeFactArray(parsed.preferences, { fields: PREFERENCE_TEXT_FIELD_KEYS }),
 					timelines: normalizeFactArray(parsed.timelines, {
 						fields: TIMELINE_TEXT_FIELD_KEYS,
 						joinFields: true,
-						factKinds,
 					}),
 					kg: normalizeKgArray(parsed.kg),
-					factKinds,
 				};
 			}
 		} catch {
@@ -286,11 +283,11 @@ export function parseExtractedFactCategories(rawOutput: string | null | undefine
 			return emptyFactCategories();
 		}
 	}
-	const cleaned: string[] = [];
+	const cleaned: ExtractedMemoryFact[] = [];
 	for (const line of raw.split("\n")) {
 		const numbered = /^\s*(?:[-*]|\d+[.)])\s+(.+)$/.exec(line);
 		const fact = (numbered?.[1] ?? line).trim();
-		if (/\b(?:no (?:durable |persistent |meaningful )?(?:facts|memories)|nothing to (?:extract|remember)|no_facts)\b/i.test(fact)) continue;
+		if (/^(?:(?:there (?:are|is) )?no (?:durable |persistent |meaningful )?(?:facts|memories)(?: (?:found|to (?:extract|remember)))?|nothing to (?:extract|remember)|no_facts)[.!?]*$/i.test(fact)) continue;
 		const declarativeText = fact.normalize("NFKD").toLowerCase().replace(/\p{M}/gu, "").replace(/ı/g, "i");
 		// Accept explicit list items or declarative legacy facts, never arbitrary long prose.
 		const declarative =
@@ -299,7 +296,7 @@ export function parseExtractedFactCategories(rawOutput: string | null | undefine
 			/\b(?:toplanti|surum|yayin|son tarih|teslim|bulusma)\b.*(?:\b(?:yarin|bugun|saat)\b|\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2})|\b[a-z]+(?:dir|dur|tir|tur)\b/i.test(declarativeText);
 		if ((numbered || declarative) && hasRetainableContent(fact) && !/^(?:user|assistant|system):/i.test(fact)) {
 			const normalized = normalizeFact(fact);
-			if (normalized !== "") cleaned.push(normalized);
+			if (normalized !== "") cleaned.push({ text: normalized, kind: "world" });
 		}
 		if (cleaned.length >= FLAT_FACT_LIMIT) break;
 	}
@@ -405,7 +402,7 @@ async function localFallback(
 	if (heuristic.length > 0) {
 		diag.recordSuccess("local", heuristic.length);
 		diag.recordCall({ succeeded: true });
-		return { ...emptyFactCategories(), facts: heuristic };
+		return { ...emptyFactCategories(), facts: heuristic.map<ExtractedMemoryFact>(text => ({ text, kind: "world" })) };
 	}
 	diag.recordCall({ succeeded: false, allEmpty: true });
 	return emptyFactCategories();
@@ -486,7 +483,7 @@ async function runFactExtraction(
 		if (heuristic.length > 0) {
 			diag.recordSuccess("local", heuristic.length);
 			diag.recordCall({ succeeded: true });
-			return { ...emptyFactCategories(), facts: heuristic };
+			return { ...emptyFactCategories(), facts: heuristic.map<ExtractedMemoryFact>(text => ({ text, kind: "world" })) };
 		}
 		diag.recordFailure("local", undefined, "llm_unavailable_at_call_site");
 		diag.recordCall({ succeeded: false });
@@ -522,12 +519,11 @@ export async function extractFactCategories(
 	const extracted = await runFactExtraction(text, options);
 	if (options.sourceKind !== "experience") return extracted;
 	return {
-		facts: extracted.facts.filter(fact => extracted.factKinds?.[fact] === "experience"),
-		timelines: extracted.timelines.filter(fact => extracted.factKinds?.[fact] === "experience"),
+		facts: extracted.facts.filter(fact => fact.kind === "experience"),
+		timelines: extracted.timelines.filter(fact => fact.kind === "experience"),
 		instructions: [],
 		preferences: [],
 		kg: [],
-		factKinds: extracted.factKinds,
 	};
 }
 

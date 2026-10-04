@@ -4,7 +4,7 @@ import { generateId, stableMemoryId } from "../../util/ids";
 import { aaakEncode } from "../aaak";
 import { REGEX_EXTRACTION_MAX_INPUT_CHARS } from "../entities";
 import { EpisodicGraph } from "../episodic-graph";
-import { type ExtractedFactCategories, heuristicExtractFacts } from "../extraction";
+import { type ExtractedFactCategories, type ExtractedMemoryFact, heuristicExtractFacts } from "../extraction";
 import { hasRetainableContent } from "../content-noise";
 import {
 	classifyObservation,
@@ -970,12 +970,11 @@ export function detectLanguage(_beam: BeamMemoryState, text: string): string {
 }
 type StoreFactStringOptions = {
 	routeHeuristicCategories?: boolean;
-	factKinds?: Readonly<Record<string, MemoryFactKind>>;
 };
 
 export function storeFactStrings(
 	beam: BeamMemoryState,
-	facts: readonly string[],
+	facts: readonly (string | ExtractedMemoryFact)[],
 	messageIdx = 0,
 	sourceMemoryId: string | null = null,
 	importance = 0.7,
@@ -983,12 +982,13 @@ export function storeFactStrings(
 ): number {
 	const routeHeuristicCategories = options.routeHeuristicCategories ?? true;
 	let stored = 0;
-	for (const fact of facts) {
+	for (const item of facts) {
+		const fact = typeof item === "string" ? item : item.text;
 		if (!hasRetainableContent(fact)) continue;
-		const memoryKind = options.factKinds?.[fact] === "experience" ? "experience" : "world";
+		const memoryKind = typeof item === "string" ? "world" : item.kind;
 		insertFactRows(beam, messageIdx, "entity", "fact", fact, fact, importance, sourceMemoryId, memoryKind);
 		stored++;
-		if (!routeHeuristicCategories) continue;
+		if (!routeHeuristicCategories || memoryKind === "experience") continue;
 		const pref = /^The user (prefers|dislikes) (.+)$/i.exec(fact);
 		if (pref?.[2]) {
 			insertPreference(beam, messageIdx, fact, pref[2], sourceMemoryId);
@@ -1009,29 +1009,24 @@ export function storeExtractedFactCategories(
 	sourceMemoryId: string | null = null,
 	importance = 0.7,
 ): number {
-	let stored = storeFactStrings(beam, extracted.facts, messageIdx, sourceMemoryId, importance, {
-		factKinds: extracted.factKinds,
-	});
+	let stored = storeFactStrings(beam, extracted.facts, messageIdx, sourceMemoryId, importance);
 	stored += storeFactStrings(beam, extracted.instructions, messageIdx, sourceMemoryId, importance, {
 		routeHeuristicCategories: false,
-		factKinds: extracted.factKinds,
 	});
 	stored += storeFactStrings(beam, extracted.preferences, messageIdx, sourceMemoryId, importance, {
 		routeHeuristicCategories: false,
-		factKinds: extracted.factKinds,
 	});
 	stored += storeFactStrings(beam, extracted.timelines, messageIdx, sourceMemoryId, importance, {
 		routeHeuristicCategories: false,
-		factKinds: extracted.factKinds,
 	});
 	for (const instruction of extracted.instructions) {
-		insertInstruction(beam, messageIdx, instruction, instruction, sourceMemoryId);
+		insertInstruction(beam, messageIdx, instruction.text, instruction.text, sourceMemoryId);
 	}
 	for (const preference of extracted.preferences) {
-		insertPreference(beam, messageIdx, preference, null, sourceMemoryId);
+		insertPreference(beam, messageIdx, preference.text, null, sourceMemoryId);
 	}
 	for (const timeline of extracted.timelines) {
-		insertTimeline(beam, messageIdx, timelineDate(timeline), timeline, sourceMemoryId);
+		insertTimeline(beam, messageIdx, timelineDate(timeline.text), timeline.text, sourceMemoryId);
 	}
 	for (const triple of extracted.kg) {
 		insertKg(beam, messageIdx, triple.subject, triple.predicate, triple.object, sourceMemoryId);

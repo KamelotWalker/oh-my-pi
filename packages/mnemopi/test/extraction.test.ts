@@ -94,6 +94,14 @@ describe("structured extraction", () => {
 		expect(parseFacts('{"facts":[broken "The user prefers tabs"]}')).toEqual([]);
 	});
 
+	it("retains assertions containing no-facts phrases while ignoring whole-line empty markers", () => {
+		expect(parseFacts("- The user has no memories of the incident\n- The database has no facts stored")).toEqual([
+			"The user has no memories of the incident",
+			"The database has no facts stored",
+		]);
+		expect(parseFacts("No memories.\n- NO_FACTS\nNothing to remember.\nThere are no durable facts to extract.")).toEqual([]);
+	});
+
 	it("keeps Turkish declarative facts and scheduled events in legacy line output", () => {
 		expect(parseFacts("Gabi İstanbul'da oturur.\nToplantı yarın saat 15:00'te.\nKullanıcı geliştiricidir.\nSelam Echo")).toEqual([
 			"Gabi İstanbul'da oturur",
@@ -111,15 +119,29 @@ describe("structured extraction", () => {
 			],
 			preferences: [{ text: "Koyu tema tercih ediyor.", kind: "world" }],
 		}));
-		expect(extracted.facts).toEqual(["The user prefers tabs", "The agent fixed the parser"]);
-		expect(extracted.factKinds).toEqual({
-			"The user prefers tabs": "world",
-			"The agent fixed the parser": "experience",
-			"Koyu tema tercih ediyor": "world",
-		});
+		expect(extracted.facts).toEqual([
+			{ text: "The user prefers tabs", kind: "world" },
+			{ text: "The agent fixed the parser", kind: "experience" },
+		]);
+		expect(extracted.preferences).toEqual([{ text: "Koyu tema tercih ediyor", kind: "world" }]);
 		expect(parseFacts('{"facts":[{"text":"The agent fixed the parser","kind":"experience"}]}')).toEqual([
 			"The agent fixed the parser",
 		]);
+	});
+
+	it("keeps coincident normalized texts typed independently across items and categories", () => {
+		const extracted = parseExtractedFactCategories(JSON.stringify({
+			facts: [
+				{ text: "The parser uses tabs.", kind: "world" },
+				{ text: "The parser uses tabs!", kind: "experience" },
+			],
+			timelines: [{ text: "The parser uses tabs", kind: "world" }],
+		}));
+		expect(extracted.facts).toEqual([
+			{ text: "The parser uses tabs", kind: "world" },
+			{ text: "The parser uses tabs", kind: "experience" },
+		]);
+		expect(extracted.timelines).toEqual([{ text: "The parser uses tabs", kind: "world" }]);
 	});
 	it("uses deterministic heuristic extraction when no LLM is configured", async () => {
 		process.env.MNEMOPI_LLM_ENABLED = "false";

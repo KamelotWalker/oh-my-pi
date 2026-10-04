@@ -10,6 +10,7 @@
 ### Fixed
 
 - Stopped chatter and arbitrary prose from becoming facts through extraction fallback, including framed conversation input. Preserved Turkish declarative legacy output and completed items in truncated structured JSON without retaining unfinished items or schema text.
+- Fixed extracted facts with identical text overwriting each other's `world`/`experience` provenance, and preserved legitimate legacy facts containing phrases such as "no memories" or "no facts".
 
 
 ## [18.5.1] - 2026-10-03
