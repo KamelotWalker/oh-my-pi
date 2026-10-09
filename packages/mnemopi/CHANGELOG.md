@@ -12,6 +12,15 @@
 - Stopped chatter and arbitrary prose from becoming facts through extraction fallback, including framed conversation input. Preserved Turkish declarative legacy output and completed items in truncated structured JSON without retaining unfinished items or schema text. ([#14314](https://github.com/can1357/oh-my-pi/pull/14314) by [@KamelotWalker](https://github.com/KamelotWalker))
 - Fixed extracted facts with identical text overwriting each other's `world`/`experience` provenance, and preserved legitimate legacy facts containing phrases such as "no memories" or "no facts". ([#14314](https://github.com/can1357/oh-my-pi/pull/14314) by [@KamelotWalker](https://github.com/KamelotWalker))
 - Fixed observation supersession chains losing their surviving winner after source deletion, legacy normalized fact IDs splitting evidence, and legacy KG IDs hiding both workplace claims on reconfirmation. Mixed-scope sleep summaries now retain the narrowest source visibility, and returning preferences correctly supersede their explicit negations. ([#14314](https://github.com/can1357/oh-my-pi/pull/14314) by [@KamelotWalker](https://github.com/KamelotWalker))
+### Fixed
+
+- Fixed proactive linking freezing the host for seconds per stored memory on large banks; a memory's graph links are now written in one commit instead of one per link ([#14998](https://github.com/can1357/oh-my-pi/issues/14998)).
+
+## [18.8.5] - 2026-10-08
+
+### Fixed
+
+- Fixed new memories gaining graph links (`related_to`, `references`, `ctx`) to memories that were already invalidated, superseded, or expired; proactive linking and consolidation now link only to memories recall can still return, so the graph stops growing toward retired memories ([#14427](https://github.com/can1357/oh-my-pi/pull/14427) by [@tickernelz](https://github.com/tickernelz)).
 
 ## [18.5.1] - 2026-10-03
 
